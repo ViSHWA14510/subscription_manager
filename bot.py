@@ -911,6 +911,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 3 handled by photo handlers below
 
+    # ── Set-join-date flow: months ────────────────────────
+    elif awaiting == "sjd_months":
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❗ Please send a valid number of months (e.g. 1, 3, 6, 12).")
+            return
+        context.user_data["sjd_months"] = int(text)
+        context.user_data["awaiting"]   = None
+        await _finish_set_join_date(update, context)
+
 
 async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Payment screenshot from owner."""
@@ -936,7 +945,7 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ─────────────────────────────────────────────
 
 async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /setjoindate <user_id> <channel_id> <DD-MM-YYYY>"""
+    """Usage: /setjoindate <user_id> <channel_id> <DD-MM-YYYY>  — then bot asks for months"""
     if not is_owner(update.effective_user.id):
         return
     args = context.args
@@ -976,28 +985,63 @@ async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username     = (user_info.username or user_info.first_name or str(uid)) if user_info else str(uid)
     first_name   = user_info.first_name if user_info else ""
 
-    db.set_join_date(uid, channel_id, new_join)
-
-    expiry    = parse_dt(sub["expiry_date"])
+    # Save state and ask for subscription period
+    context.user_data["sjd_uid"]          = uid
+    context.user_data["sjd_channel_id"]   = channel_id
+    context.user_data["sjd_channel_name"] = channel_name
+    context.user_data["sjd_new_join"]     = new_join.isoformat()
+    context.user_data["sjd_username"]     = username
+    context.user_data["sjd_first_name"]   = first_name
+    context.user_data["awaiting"]         = "sjd_months"
 
     await update.message.reply_text(
-        "✅ <b>Join Date Updated!</b>\n\n"
-        f"👤 User: <a href=\"tg://user?id={uid}\">{first_name or username}</a>\n"
-        f"🆔 ID: <code>{uid}</code>\n"
+        "📅 <b>Set Join Date</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={uid}\">{first_name or username}</a> (<code>{uid}</code>)\n"
         f"📢 Channel: <b>{channel_name}</b>\n"
-        f"📅 New Join Date: <b>{new_join.strftime('%d %b %Y')} UTC</b>\n"
-        f"📆 Expiry: <b>{expiry.strftime('%d %b %Y %H:%M')} UTC</b>",
-        parse_mode="HTML"
+        f"📆 New Join Date: <b>{new_join.strftime('%d %b %Y')} UTC</b>\n\n"
+        "⏳ How many <b>months</b> is this subscription period?\n"
+        "<i>Expiry will be recalculated as: join date + months</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="ap_back")
+        ]])
     )
+
+
+async def _finish_set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finalise set-join-date flow — save join date + recalculated expiry."""
+    data         = context.user_data
+    uid          = data["sjd_uid"]
+    channel_id   = data["sjd_channel_id"]
+    channel_name = data["sjd_channel_name"]
+    months       = data["sjd_months"]
+    username     = data["sjd_username"]
+    first_name   = data["sjd_first_name"]
+    new_join     = parse_dt(data["sjd_new_join"])
+    new_expiry   = new_join + timedelta(days=30 * months)
+
+    db.set_join_date(uid, channel_id, new_join)
+    db.update_subscription_expiry(uid, channel_id, new_expiry, join_date=new_join)
+    context.user_data.clear()
+
+    confirm = (
+        "✅ <b>Join Date &amp; Expiry Updated!</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={uid}\">{first_name or username}</a> (<code>{uid}</code>)\n"
+        f"📢 Channel: <b>{channel_name}</b>\n"
+        f"📅 Join Date: <b>{new_join.strftime('%d %b %Y')} UTC</b>\n"
+        f"🗓 Period: <b>{months} month(s)</b>\n"
+        f"📆 New Expiry: <b>{new_expiry.strftime('%d %b %Y')} UTC</b>"
+    )
+    await update.message.reply_text(confirm, parse_mode="HTML")
 
     try:
         await send_sub_info(
             context.bot, uid,
             username=username, user_id=uid,
             channel_name=channel_name,
-            join_date=new_join, expiry=expiry,
+            join_date=new_join, expiry=new_expiry,
             first_name=first_name,
-            extra_caption="📅 <b>Your Join Date Has Been Updated</b>"
+            extra_caption="📅 <b>Your Subscription Has Been Updated</b>"
         )
     except Exception:
         pass
