@@ -245,4 +245,3 @@ class Database:
         if isinstance(doc.get("join_date"), datetime):
             doc["join_date"] = doc["join_date"].isoformat()
         return doc
-
