@@ -18,6 +18,7 @@ class Database:
         self.db = self.client[DB_NAME]
         self.channels: Collection = self.db["managed_channels"]
         self.subs: Collection = self.db["subscriptions"]
+        self.pending: Collection = self.db["pending_approvals"]
 
     # ─── Schema / Indexes ─────────────────────────────────
 
@@ -28,6 +29,9 @@ class Database:
         )
         self.subs.create_index("expiry_date")
         self.subs.create_index("is_active")
+        self.pending.create_index(
+            [("user_id", ASCENDING), ("channel_id", ASCENDING)], unique=True
+        )
         print("✅ MongoDB initialized.")
 
     # ─── Managed Channels ─────────────────────────────────
@@ -57,9 +61,46 @@ class Database:
         doc = self.channels.find_one({"channel_id": channel_id}, {"_id": 0})
         return doc
 
+    # ─── Pending Approvals ────────────────────────────────
+
+    def add_pending(self, user_id: int, channel_id: str, username: str,
+                    first_name: str, join_date: datetime, channel_name: str):
+        self.pending.update_one(
+            {"user_id": user_id, "channel_id": channel_id},
+            {"$set": {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "username": username,
+                "first_name": first_name,
+                "join_date": join_date,
+                "created_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+
+    def get_pending(self, user_id: int, channel_id: str) -> Optional[Dict]:
+        doc = self.pending.find_one(
+            {"user_id": user_id, "channel_id": channel_id}, {"_id": 0}
+        )
+        if doc and isinstance(doc.get("join_date"), datetime):
+            doc["join_date"] = doc["join_date"].isoformat()
+        return doc
+
+    def remove_pending(self, user_id: int, channel_id: str):
+        self.pending.delete_one({"user_id": user_id, "channel_id": channel_id})
+
+    def get_all_pending(self) -> List[Dict]:
+        docs = list(self.pending.find({}, {"_id": 0}).sort("created_at", ASCENDING))
+        for doc in docs:
+            if isinstance(doc.get("join_date"), datetime):
+                doc["join_date"] = doc["join_date"].isoformat()
+        return docs
+
     # ─── Subscriptions ────────────────────────────────────
 
-    def add_subscription(self, user_id: int, channel_id: str, expiry: datetime, username: str = ""):
+    def add_subscription(self, user_id: int, channel_id: str, expiry: datetime,
+                         username: str = "", join_date: datetime = None):
         self.subs.update_one(
             {"user_id": user_id, "channel_id": channel_id},
             {"$set": {
@@ -69,21 +110,29 @@ class Database:
                 "expiry_date": expiry,
                 "is_active": True,
                 "notified_3d": False,
+                "notified_1d": False,
                 "expired_notified": False,
-                "created_at": datetime.now(timezone.utc),
+                "created_at": join_date or datetime.now(timezone.utc),
+                "join_date": join_date or datetime.now(timezone.utc),
             }},
             upsert=True,
         )
 
-    def update_subscription_expiry(self, user_id: int, channel_id: str, expiry: datetime):
+    def update_subscription_expiry(self, user_id: int, channel_id: str,
+                                   expiry: datetime, join_date: datetime = None):
+        update_fields = {
+            "expiry_date": expiry,
+            "is_active": True,
+            "notified_3d": False,
+            "notified_1d": False,
+            "expired_notified": False,
+        }
+        if join_date:
+            update_fields["join_date"] = join_date
+            update_fields["created_at"] = join_date
         self.subs.update_one(
             {"user_id": user_id, "channel_id": channel_id},
-            {"$set": {
-                "expiry_date": expiry,
-                "is_active": True,
-                "notified_3d": False,
-                "expired_notified": False,
-            }},
+            {"$set": update_fields},
         )
 
     def deactivate_subscription(self, user_id: int, channel_id: str):
@@ -128,6 +177,19 @@ class Database:
         )
         return [self._attach_channel_name(d) for d in docs]
 
+    def get_expiring_subscriptions_1d(self) -> List[Dict]:
+        now = datetime.now(timezone.utc)
+        cutoff = now + timedelta(days=1)
+        docs = self.subs.find(
+            {
+                "is_active": True,
+                "notified_1d": False,
+                "expiry_date": {"$gt": now, "$lte": cutoff},
+            },
+            {"_id": 0},
+        )
+        return [self._attach_channel_name(d) for d in docs]
+
     def get_expired_subscriptions(self) -> List[Dict]:
         now = datetime.now(timezone.utc)
         docs = self.subs.find(
@@ -151,6 +213,18 @@ class Database:
                 {"user_id": user_id, "channel_id": channel_id},
                 {"$set": {"notified_3d": True}},
             )
+        elif level == "1d":
+            self.subs.update_one(
+                {"user_id": user_id, "channel_id": channel_id},
+                {"$set": {"notified_1d": True}},
+            )
+
+    def set_join_date(self, user_id: int, channel_id: str, join_date: datetime):
+        """Manually set or correct a user's join date."""""
+        self.subs.update_one(
+            {"user_id": user_id, "channel_id": channel_id},
+            {"$set": {"join_date": join_date, "created_at": join_date}},
+        )
 
     def mark_expired_notified(self, user_id: int, channel_id: str):
         self.subs.update_one(
@@ -161,12 +235,14 @@ class Database:
     # ─── Internal helper ──────────────────────────────────
 
     def _attach_channel_name(self, doc: Dict) -> Dict:
-        """Join channel name onto a subscription doc (replaces SQL LEFT JOIN)."""
+        """Join channel name onto a subscription doc."""
         channel = self.channels.find_one(
             {"channel_id": doc.get("channel_id")}, {"name": 1, "_id": 0}
         )
         doc["channel_name"] = channel["name"] if channel else doc.get("channel_id", "")
-        # Normalise expiry_date to isoformat string so callers stay unchanged
         if isinstance(doc.get("expiry_date"), datetime):
             doc["expiry_date"] = doc["expiry_date"].isoformat()
+        if isinstance(doc.get("join_date"), datetime):
+            doc["join_date"] = doc["join_date"].isoformat()
         return doc
+
