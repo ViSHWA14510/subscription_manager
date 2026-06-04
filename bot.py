@@ -1,5 +1,13 @@
 import logging
 from datetime import datetime, timedelta, timezone
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def to_ist(dt: datetime) -> datetime:
+    """Convert any UTC-aware datetime to IST."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -70,8 +78,8 @@ def sub_info_text(username: str, user_id: int, channel_name: str,
         f"🔖 Username:- {username_line}\n"
         f"🆔 User Id:- <code>{user_id}</code>\n"
         f"📢 Channel:- <b>{channel_name}</b>\n"
-        f"📅 Join Date:- <b>{join_date.strftime('%d %b %Y %H:%M')} UTC</b>\n"
-        f"📆 Expire Date:- <b>{expiry.strftime('%d %b %Y %H:%M')} UTC</b>\n"
+        f"📅 Join Date:- <b>{to_ist(join_date).strftime('%d %b %Y %H:%M')} IST</b>\n"
+        f"📆 Expire Date:- <b>{to_ist(expiry).strftime('%d %b %Y %H:%M')} IST</b>\n"
         f"⏳ Expires In:- <b>{fmt_remaining(expiry)}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -194,8 +202,8 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji     = status_emoji(expiry)
         text += (
             f"{emoji} <b>{sub.get('channel_name', 'Unknown')}</b>\n"
-            f"   🗓 Joined:    {join_date.strftime('%d %b %Y %H:%M')} UTC\n"
-            f"   📅 Expires:   {expiry.strftime('%d %b %Y %H:%M')} UTC\n"
+            f"   🗓 Joined:    {to_ist(join_date).strftime('%d %b %Y %H:%M')} IST\n"
+            f"   📅 Expires:   {to_ist(expiry).strftime('%d %b %Y %H:%M')} IST\n"
             f"   ⏳ Remaining: {fmt_remaining(expiry)}\n\n"
         )
     text += "━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -318,7 +326,7 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"🔖 Username: @{username}\n"
             f"🆔 User ID: <code>{user.id}</code>\n"
             f"📢 Channel: <b>{chat.title}</b>\n"
-            f"🕐 Joined: <b>{join_date.strftime('%d %b %Y %H:%M')} UTC</b>\n\n"
+            f"🕐 Joined: <b>{to_ist(join_date).strftime('%d %b %Y %H:%M')} IST</b>\n\n"
             "Please verify payment and approve or reject."
         )
         await context.bot.send_message(
@@ -360,8 +368,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             emoji = status_emoji(expiry)
             text += (
                 f"{emoji} <b>{sub.get('channel_name', 'Unknown')}</b>\n"
-                f"   🗓 Joined:   {join_date.strftime('%d %b %Y %H:%M')} UTC\n"
-                f"   📅 Expires:  {expiry.strftime('%d %b %Y %H:%M')} UTC\n"
+                f"   🗓 Joined:   {to_ist(join_date).strftime('%d %b %Y %H:%M')} IST\n"
+                f"   📅 Expires:  {to_ist(expiry).strftime('%d %b %Y %H:%M')} IST\n"
                 f"   ⏳ Remaining: {fmt_remaining(expiry)}\n\n"
             )
         await query.edit_message_text(text, parse_mode="HTML")
@@ -607,7 +615,7 @@ async def _show_pending_list(query):
         ch    = p.get("channel_name", p["channel_id"])
         text += (
             f"👤 @{uname} (<code>{p['user_id']}</code>)\n"
-            f"   📢 {ch} | 🕐 {jd.strftime('%d %b %H:%M')} UTC\n\n"
+            f"   📢 {ch} | 🕐 {to_ist(jd).strftime('%d %b %H:%M')} IST\n\n"
         )
         keyboard.append([
             InlineKeyboardButton(
@@ -686,8 +694,8 @@ async def _show_user_detail(query, uid: int):
         channel_id = sub["channel_id"]
         text += (
             f"{emoji} <b>{ch_name}</b>\n"
-            f"   🗓 Join Date:   {join_date.strftime('%d %b %Y %H:%M')} UTC\n"
-            f"   📆 Expire Date: {expiry.strftime('%d %b %Y %H:%M')} UTC\n"
+            f"   🗓 Join Date:   {to_ist(join_date).strftime('%d %b %Y %H:%M')} IST\n"
+            f"   📆 Expire Date: {to_ist(expiry).strftime('%d %b %Y %H:%M')} IST\n"
             f"   ⏳ Expires In:  {fmt_remaining(expiry)}\n"
             f"   Status: {'✅ Active' if is_active else '❌ Inactive'}\n\n"
         )
@@ -838,7 +846,7 @@ async def _finish_add_sub(update_or_query, context: ContextTypes.DEFAULT_TYPE,
     confirm = (
         f"✅ {'Extended' if action == 'extend' else 'Added'} subscription for "
         f"<code>{uid}</code> (@{username})\n"
-        f"📢 {channel_name} — expires <b>{new_expiry.strftime('%d %b %Y')}</b>"
+        f"📢 {channel_name} — expires <b>{to_ist(new_expiry).strftime('%d %b %Y')}</b>"
     )
     if hasattr(update_or_query, 'callback_query'):
         await update_or_query.effective_message.reply_text(confirm, parse_mode="HTML")
@@ -877,7 +885,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"👤 User: <b>{name}</b> (<code>{uid}</code>)\n"
                 f"📢 Channel: <b>{context.user_data['add_channel_name']}</b>\n\n"
-                f"⚠️ Already subscribed — expires <b>{expiry.strftime('%d %b %Y')}</b> ({fmt_remaining(expiry)} left)\n\n"
+                f"⚠️ Already subscribed — expires <b>{to_ist(expiry).strftime('%d %b %Y')}</b> ({fmt_remaining(expiry)} left)\n\n"
                 "How many <b>months</b> to extend?",
                 parse_mode="HTML"
             )
@@ -998,7 +1006,7 @@ async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📅 <b>Set Join Date</b>\n\n"
         f"👤 User: <a href=\"tg://user?id={uid}\">{first_name or username}</a> (<code>{uid}</code>)\n"
         f"📢 Channel: <b>{channel_name}</b>\n"
-        f"📆 New Join Date: <b>{new_join.strftime('%d %b %Y')} UTC</b>\n\n"
+        f"📆 New Join Date: <b>{to_ist(new_join).strftime('%d %b %Y')} IST</b>\n\n"
         "⏳ How many <b>months</b> is this subscription period?\n"
         "<i>Expiry will be recalculated as: join date + months</i>",
         parse_mode="HTML",
@@ -1028,9 +1036,9 @@ async def _finish_set_join_date(update: Update, context: ContextTypes.DEFAULT_TY
         "✅ <b>Join Date &amp; Expiry Updated!</b>\n\n"
         f"👤 User: <a href=\"tg://user?id={uid}\">{first_name or username}</a> (<code>{uid}</code>)\n"
         f"📢 Channel: <b>{channel_name}</b>\n"
-        f"📅 Join Date: <b>{new_join.strftime('%d %b %Y')} UTC</b>\n"
+        f"📅 Join Date: <b>{to_ist(new_join).strftime('%d %b %Y')} IST</b>\n"
         f"🗓 Period: <b>{months} month(s)</b>\n"
-        f"📆 New Expiry: <b>{new_expiry.strftime('%d %b %Y')} UTC</b>"
+        f"📆 New Expiry: <b>{to_ist(new_expiry).strftime('%d %b %Y')} IST</b>"
     )
     await update.message.reply_text(confirm, parse_mode="HTML")
 
