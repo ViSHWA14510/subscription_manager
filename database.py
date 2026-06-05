@@ -19,6 +19,7 @@ class Database:
         self.channels: Collection = self.db["managed_channels"]
         self.subs: Collection = self.db["subscriptions"]
         self.pending: Collection = self.db["pending_approvals"]
+        self.payment_requests: Collection = self.db["payment_requests"]
 
     # ─── Schema / Indexes ─────────────────────────────────
 
@@ -32,6 +33,10 @@ class Database:
         self.pending.create_index(
             [("user_id", ASCENDING), ("channel_id", ASCENDING)], unique=True
         )
+        self.payment_requests.create_index(
+            [("user_id", ASCENDING), ("channel_id", ASCENDING)]
+        )
+        self.payment_requests.create_index("status")
         print("✅ MongoDB initialized.")
 
     # ─── Managed Channels ─────────────────────────────────
@@ -61,7 +66,50 @@ class Database:
         doc = self.channels.find_one({"channel_id": channel_id}, {"_id": 0})
         return doc
 
-    # ─── Pending Approvals ────────────────────────────────
+    # ─── Payment Requests ─────────────────────────────────
+
+    def add_payment_request(self, user_id: int, channel_id: str, channel_name: str,
+                             username: str, first_name: str, months: int,
+                             amount: int, screenshot_file_id: str = None):
+        import uuid
+        request_id = str(uuid.uuid4())[:8].upper()
+        self.payment_requests.insert_one({
+            "request_id": request_id,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "username": username,
+            "first_name": first_name,
+            "months": months,
+            "amount": amount,
+            "screenshot_file_id": screenshot_file_id,
+            "status": "pending",   # pending | approved | rejected
+            "created_at": datetime.now(timezone.utc),
+        })
+        return request_id
+
+    def get_payment_request(self, request_id: str) -> Optional[Dict]:
+        doc = self.payment_requests.find_one({"request_id": request_id}, {"_id": 0})
+        return doc
+
+    def get_pending_payment_requests(self) -> List[Dict]:
+        return list(self.payment_requests.find(
+            {"status": "pending"}, {"_id": 0}
+        ).sort("created_at", ASCENDING))
+
+    def update_payment_status(self, request_id: str, status: str):
+        self.payment_requests.update_one(
+            {"request_id": request_id},
+            {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
+        )
+
+    def get_user_pending_payment(self, user_id: int, channel_id: str) -> Optional[Dict]:
+        return self.payment_requests.find_one(
+            {"user_id": user_id, "channel_id": channel_id, "status": "pending"},
+            {"_id": 0}
+        )
+
+    # ─── Pending Approvals (join-based) ──────────────────
 
     def add_pending(self, user_id: int, channel_id: str, username: str,
                     first_name: str, join_date: datetime, channel_name: str):
@@ -100,21 +148,27 @@ class Database:
     # ─── Subscriptions ────────────────────────────────────
 
     def add_subscription(self, user_id: int, channel_id: str, expiry: datetime,
-                         username: str = "", join_date: datetime = None):
+                         username: str = "", join_date: datetime = None,
+                         months: int = None, channel_name: str = None):
+        fields = {
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "username": username,
+            "expiry_date": expiry,
+            "is_active": True,
+            "notified_3d": False,
+            "notified_1d": False,
+            "expired_notified": False,
+            "created_at": join_date or datetime.now(timezone.utc),
+            "join_date": join_date or datetime.now(timezone.utc),
+        }
+        if months is not None:
+            fields["months"] = months
+        if channel_name:
+            fields["channel_name"] = channel_name
         self.subs.update_one(
             {"user_id": user_id, "channel_id": channel_id},
-            {"$set": {
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "username": username,
-                "expiry_date": expiry,
-                "is_active": True,
-                "notified_3d": False,
-                "notified_1d": False,
-                "expired_notified": False,
-                "created_at": join_date or datetime.now(timezone.utc),
-                "join_date": join_date or datetime.now(timezone.utc),
-            }},
+            {"$set": fields},
             upsert=True,
         )
 
@@ -220,7 +274,7 @@ class Database:
             )
 
     def set_join_date(self, user_id: int, channel_id: str, join_date: datetime):
-        """Manually set or correct a user's join date."""""
+        """Manually set or correct a user's join date."""
         self.subs.update_one(
             {"user_id": user_id, "channel_id": channel_id},
             {"$set": {"join_date": join_date, "created_at": join_date}},
