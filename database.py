@@ -20,6 +20,7 @@ class Database:
         self.subs: Collection = self.db["subscriptions"]
         self.pending: Collection = self.db["pending_approvals"]
         self.payment_requests: Collection = self.db["payment_requests"]
+        self.settings: Collection = self.db["bot_settings"]
 
     # ─── Schema / Indexes ─────────────────────────────────
 
@@ -38,6 +39,20 @@ class Database:
         )
         self.payment_requests.create_index("status")
         print("✅ MongoDB initialized.")
+
+
+    # ─── Bot Settings (UPI ID, QR etc.) ──────────────────
+
+    def get_setting(self, key: str, default=None):
+        doc = self.settings.find_one({"key": key}, {"_id": 0})
+        return doc["value"] if doc else default
+
+    def set_setting(self, key: str, value):
+        self.settings.update_one(
+            {"key": key},
+            {"$set": {"key": key, "value": value}},
+            upsert=True,
+        )
 
     # ─── Managed Channels ─────────────────────────────────
 
