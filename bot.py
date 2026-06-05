@@ -8,6 +8,7 @@ def to_ist(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST)
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -23,6 +24,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 db = Database()
+
+
+# ─────────────────────────────────────────────
+#  PAYMENT PLANS  ← EDIT PRICES HERE
+#  Format: (label, months, price_in_rupees)
+# ─────────────────────────────────────────────
+PLANS = [
+    ("1 Month",  1,   499),
+    ("3 Months", 3,  1299),
+    ("6 Months", 6,  2299),
+    ("1 Year",  12,  3999),
+]
+
+# ─────────────────────────────────────────────
+#  UPI CONFIG  ← SET YOUR UPI ID & QR HERE
+# ─────────────────────────────────────────────
+UPI_ID   = Config.UPI_ID        # set in .env: UPI_ID=yourname@upi
+QR_FILE_ID = Config.UPI_QR_FILE_ID  # set in .env after sending QR to bot once
 
 
 # ─────────────────────────────────────────────
@@ -112,7 +131,8 @@ def owner_panel_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 All Users", callback_data="ap_users"),
          InlineKeyboardButton("📢 Channels", callback_data="ap_channels")],
-        [InlineKeyboardButton("⏳ Pending Approvals", callback_data="ap_pending")],
+        [InlineKeyboardButton("⏳ Pending Approvals", callback_data="ap_pending"),
+         InlineKeyboardButton("💳 Payment Requests", callback_data="ap_payments")],
         [InlineKeyboardButton("➕ Add / Extend Sub", callback_data="ap_add_start")],
         [InlineKeyboardButton("📣 Broadcast", callback_data="ap_broadcast_prompt")],
     ])
@@ -126,6 +146,49 @@ def month_picker_keyboard(user_id: int, channel_id: str, prefix: str) -> InlineK
         for m in months
     ]
     return InlineKeyboardMarkup([row, [InlineKeyboardButton("❌ Cancel", callback_data="ap_back")]])
+
+
+# ─────────────────────────────────────────────
+#  INVITE LINK — create & schedule revoke
+# ─────────────────────────────────────────────
+
+async def create_invite_and_schedule_revoke(
+    bot, job_queue, channel_id: str, user_id: int
+) -> str:
+    """
+    Creates a one-time invite link valid for 1 hour.
+    Schedules a job to revoke it after 1 hour.
+    Returns the invite link URL.
+    """
+    expire_at = now_utc() + timedelta(hours=1)
+    link_obj = await bot.create_chat_invite_link(
+        chat_id=channel_id,
+        expire_date=expire_at,
+        member_limit=1,          # one-time use
+        name=f"pay_{user_id}"
+    )
+    invite_url = link_obj.invite_link
+
+    # Schedule revocation after 1 hour
+    job_queue.run_once(
+        _revoke_invite_link,
+        when=3600,
+        data={"channel_id": channel_id, "invite_link": invite_url},
+        name=f"revoke_{user_id}_{channel_id}"
+    )
+    return invite_url
+
+
+async def _revoke_invite_link(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    try:
+        await context.bot.revoke_chat_invite_link(
+            chat_id=data["channel_id"],
+            invite_link=data["invite_link"]
+        )
+        logger.info(f"Revoked invite link for channel {data['channel_id']}")
+    except Exception as e:
+        logger.warning(f"Could not revoke invite link: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -155,6 +218,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard = [
             [InlineKeyboardButton("📋 My Subscriptions", callback_data="my_subscription")],
+            [InlineKeyboardButton("💳 Buy Subscription", callback_data="pay_start")],
         ]
         await update.message.reply_text(
             "╔══════════════════════╗\n"
@@ -164,11 +228,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🎯 <b>What can I do for you?</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💳 Buy access to premium channels\n"
             "📋 Check your active subscriptions\n"
             "⏳ See how much time is remaining\n"
             "🔔 Get notified before expiry\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "👇 <b>Tap the button below to get started!</b>",
+            "👇 <b>Tap a button below to get started!</b>",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML"
         )
@@ -187,7 +252,7 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   📭 <b>NO SUBSCRIPTIONS</b>\n"
             "╚══════════════════════╝\n\n"
             "😔 You have no active subscriptions yet.\n\n"
-            "💬 Contact the admin to get access to a premium channel!",
+            "💳 Tap /start and use <b>Buy Subscription</b> to get access!",
             parse_mode="HTML"
         )
         return
@@ -211,14 +276,14 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-#  /help — Owner command reference
+#  /help
 # ─────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text(
             "📋 <b>Available Commands</b>\n\n"
-            "🔹 /start — Welcome screen\n"
+            "🔹 /start — Welcome screen & buy subscription\n"
             "🔹 /mysubs — View your subscriptions",
             parse_mode="HTML"
         )
@@ -259,22 +324,400 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("⛔ Access denied.")
         return
-    subs = db.get_all_subscriptions()
+    subs     = db.get_all_subscriptions()
     channels = db.get_managed_channels()
-    pending = db.get_all_pending()
-    active = [s for s in subs if parse_dt(s["expiry_date"]) > now_utc()]
+    pending  = db.get_all_pending()
+    payments = db.get_pending_payment_requests()
+    active   = [s for s in subs if parse_dt(s["expiry_date"]) > now_utc()]
     text = (
         "🛠 <b>Admin Panel</b>\n\n"
         f"👥 Total active subscribers: <b>{len(active)}</b>\n"
         f"📢 Managed channels: <b>{len(channels)}</b>\n"
-        f"⏳ Pending approvals: <b>{len(pending)}</b>\n\n"
+        f"⏳ Pending join approvals: <b>{len(pending)}</b>\n"
+        f"💳 Pending payments: <b>{len(payments)}</b>\n\n"
         "Choose an action:"
     )
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=owner_panel_keyboard())
 
 
 # ─────────────────────────────────────────────
-#  CHAT MEMBER HANDLER — notify owner, wait for approval
+#  PAYMENT FLOW — User side
+# ─────────────────────────────────────────────
+
+async def _pay_show_channels(query, context):
+    """Step 1 — user picks a channel."""
+    channels = db.get_managed_channels()
+    if not channels:
+        await query.edit_message_text(
+            "⚠️ No premium channels available right now.\nPlease check back later!",
+            parse_mode="HTML"
+        )
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"pay_ch_{ch['channel_id']}")]
+        for ch in channels
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="pay_back_home")])
+    await query.edit_message_text(
+        "╔══════════════════════╗\n"
+        "   💳 <b>BUY SUBSCRIPTION</b>\n"
+        "╚══════════════════════╝\n\n"
+        "📢 <b>Step 1 — Choose a Channel</b>\n\n"
+        "Select the premium channel you want access to:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def _pay_show_plans(query, context, channel_id: str):
+    """Step 2 — user picks a plan."""
+    ch = db.get_channel_info(channel_id)
+    ch_name = ch["name"] if ch else channel_id
+    context.user_data["pay_channel_id"]   = channel_id
+    context.user_data["pay_channel_name"] = ch_name
+
+    plan_rows = []
+    for label, months, price in PLANS:
+        plan_rows.append([InlineKeyboardButton(
+            f"{'⭐' if months == 12 else '📅'} {label} — ₹{price}",
+            callback_data=f"pay_plan_{channel_id}_{months}_{price}"
+        )])
+    plan_rows.append([InlineKeyboardButton("🔙 Back", callback_data="pay_start")])
+
+    await query.edit_message_text(
+        "╔══════════════════════╗\n"
+        "   💳 <b>BUY SUBSCRIPTION</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"📢 Channel: <b>{ch_name}</b>\n\n"
+        "📅 <b>Step 2 — Choose a Plan</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(plan_rows)
+    )
+
+
+async def _pay_show_qr(query, context, channel_id: str, months: int, price: int):
+    """Step 3 — show UPI QR and instructions."""
+    ch_name = context.user_data.get("pay_channel_name", channel_id)
+    plan_label = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
+
+    context.user_data["pay_months"] = months
+    context.user_data["pay_price"]  = price
+    context.user_data["pay_awaiting_screenshot"] = True
+
+    caption = (
+        "╔══════════════════════╗\n"
+        "   💳 <b>PAYMENT DETAILS</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"📢 Channel : <b>{ch_name}</b>\n"
+        f"📅 Plan    : <b>{plan_label}</b>\n"
+        f"💰 Amount  : <b>₹{price}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 <b>STEP-BY-STEP PAYMENT GUIDE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>STEP 1 — Open Your UPI App</b>\n"
+        "┗ Open any UPI app on your phone:\n"
+        "   Google Pay / PhonePe / Paytm\n"
+        "   BHIM / any banking UPI app\n\n"
+        "<b>STEP 2 — Pay Using QR or UPI ID</b>\n"
+        "┣ 📷 <b>Option A:</b> Scan the QR code above\n"
+        f"┗ 🔤 <b>Option B:</b> Pay to UPI ID: <code>{UPI_ID}</code>\n\n"
+        "<b>STEP 3 — Enter the Exact Amount</b>\n"
+        f"┗ 💵 Type exactly: <b>₹{price}</b>\n"
+        "   ⚠️ Wrong amount = request rejected\n\n"
+        "<b>STEP 4 — Add a Note (Optional)</b>\n"
+        "┗ 📝 Write your Telegram username\n"
+        "   in the payment note / remarks field\n\n"
+        "<b>STEP 5 — Complete the Payment</b>\n"
+        "┗ ✅ Confirm and finish the transaction\n\n"
+        "<b>STEP 6 — Send Screenshot Here</b>\n"
+        "┗ 📸 Take a screenshot of the\n"
+        "   <b>payment success screen</b> and\n"
+        "   send it in <b>this chat right now</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⏳ <b>What happens after screenshot:</b>\n"
+        "• Admin verifies your payment\n"
+        "• You receive a private invite link\n"
+        "• Link is valid for <b>1 hour only — join fast!</b>\n\n"
+        "⚠️ <i>Do NOT close this chat.\n"
+        "Do NOT send the screenshot multiple times.</i>"
+    )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data="pay_cancel")
+    ]])
+
+    try:
+        # Delete old message and send QR as photo
+        await query.message.delete()
+        await query.message.chat.send_photo(
+            photo=QR_FILE_ID,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except Exception:
+        # Fallback: just edit if delete fails
+        await query.edit_message_text(
+            caption + f"\n\n📷 <i>(QR code not set — pay to UPI ID above)</i>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+
+# ─────────────────────────────────────────────
+#  PAYMENT — User sends screenshot
+# ─────────────────────────────────────────────
+
+async def handle_user_payment_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles screenshot sent by user during payment flow."""
+    user = update.effective_user
+
+    if not context.user_data.get("pay_awaiting_screenshot"):
+        return   # not in payment flow
+
+    channel_id = context.user_data.get("pay_channel_id")
+    channel_name = context.user_data.get("pay_channel_name", channel_id)
+    months     = context.user_data.get("pay_months")
+    price      = context.user_data.get("pay_price")
+
+    if not all([channel_id, months, price]):
+        await update.message.reply_text(
+            "⚠️ Session expired. Please start again with /start.",
+            parse_mode="HTML"
+        )
+        context.user_data.clear()
+        return
+
+    # Check if already has pending request for this channel
+    existing = db.get_user_pending_payment(user.id, channel_id)
+    if existing:
+        await update.message.reply_text(
+            "⏳ You already have a <b>pending payment request</b> for this channel.\n\n"
+            "Please wait for admin approval.",
+            parse_mode="HTML"
+        )
+        context.user_data.clear()
+        return
+
+    photo = update.message.photo[-1]
+    screenshot_file_id = photo.file_id
+    username = user.username or user.first_name or str(user.id)
+
+    # Save payment request
+    request_id = db.add_payment_request(
+        user_id=user.id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        username=username,
+        first_name=user.first_name or "",
+        months=months,
+        amount=price,
+        screenshot_file_id=screenshot_file_id
+    )
+
+    context.user_data.clear()
+
+    # Confirm to user
+    await update.message.reply_text(
+        "╔══════════════════════╗\n"
+        "   ✅ <b>PAYMENT SUBMITTED!</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"🆔 Request ID: <code>{request_id}</code>\n\n"
+        "📸 Your payment screenshot has been received.\n\n"
+        "⏳ <b>What happens next?</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ Admin will verify your payment\n"
+        f"2️⃣ You'll receive a <b>channel invite link</b>\n"
+        "3️⃣ The link is valid for <b>1 hour only</b> — join quickly!\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💬 Contact admin if you don't hear back within 30 minutes.",
+        parse_mode="HTML"
+    )
+
+    # Notify owner with Approve / Reject
+    plan_label = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
+    user_link = f'<a href="tg://user?id={user.id}">{user.first_name or username}</a>'
+    owner_caption = (
+        "╔══════════════════════╗\n"
+        "   💳 <b>NEW PAYMENT REQUEST</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"🆔 Request ID: <code>{request_id}</code>\n\n"
+        f"👤 Name: {user_link}\n"
+        f"🔖 Username: @{username}\n"
+        f"🆔 User ID: <code>{user.id}</code>\n"
+        f"📢 Channel: <b>{channel_name}</b>\n"
+        f"📅 Plan: <b>{plan_label}</b>\n"
+        f"💰 Amount: <b>₹{price}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ Approve → create invite link & activate subscription\n"
+        "❌ Reject → notify user, no access"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"pmt_approve_{request_id}"),
+        InlineKeyboardButton("❌ Reject",  callback_data=f"pmt_reject_{request_id}"),
+    ]])
+
+    try:
+        await context.bot.send_photo(
+            chat_id=Config.OWNER_ID,
+            photo=screenshot_file_id,
+            caption=owner_caption,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify owner about payment: {e}")
+
+
+# ─────────────────────────────────────────────
+#  PAYMENT APPROVE / REJECT — Owner side
+# ─────────────────────────────────────────────
+
+async def _approve_payment(query, context, request_id: str):
+    req = db.get_payment_request(request_id)
+    if not req:
+        await query.edit_message_caption("⚠️ Payment request not found or already resolved.")
+        return
+    if req["status"] != "pending":
+        await query.edit_message_caption(
+            f"⚠️ This request was already <b>{req['status']}</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    uid         = req["user_id"]
+    channel_id  = req["channel_id"]
+    channel_name = req["channel_name"]
+    months      = req["months"]
+    username    = req.get("username", str(uid))
+    first_name  = req.get("first_name", "")
+    price       = req.get("amount", 0)
+    plan_label  = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
+
+    join_date = now_utc()
+    expiry    = join_date + timedelta(days=30 * months)
+
+    # Check if already has active sub (renewal case)
+    existing = db.get_subscription(uid, channel_id)
+    if existing:
+        current_expiry = parse_dt(existing["expiry_date"])
+        base   = current_expiry if current_expiry > now_utc() else join_date
+        expiry = base + timedelta(days=30 * months)
+        db.update_subscription_expiry(uid, channel_id, expiry, join_date=join_date)
+        is_renewal = True
+    else:
+        db.add_subscription(uid, channel_id, expiry, username, join_date=join_date,
+                            months=months, channel_name=channel_name)
+        is_renewal = False
+
+    # Mark payment as approved
+    db.update_payment_status(request_id, "approved")
+
+    # Generate one-time invite link (1-hour expiry)
+    try:
+        invite_url = await create_invite_and_schedule_revoke(
+            context.bot, context.job_queue, channel_id, uid
+        )
+    except Exception as e:
+        logger.error(f"Could not create invite link: {e}")
+        invite_url = None
+
+    # Notify user
+    caption_prefix = "🔄 <b>Subscription Renewed!</b>" if is_renewal else "🎉 <b>Subscription Approved!</b>"
+    user_msg = (
+        f"{caption_prefix}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 Channel: <b>{channel_name}</b>\n"
+        f"📅 Plan: <b>{plan_label}</b>\n"
+        f"📆 Expires: <b>{to_ist(expiry).strftime('%d %b %Y %H:%M')} IST</b>\n"
+        f"⏳ Duration: <b>{fmt_remaining(expiry)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    if invite_url:
+        user_msg += (
+            "🔗 <b>Your Channel Invite Link:</b>\n"
+            f"<a href=\"{invite_url}\">{invite_url}</a>\n\n"
+            "⚠️ <b>This link expires in 1 hour — join now!</b>\n"
+            "🔒 It's a one-time link, don't share it."
+        )
+    else:
+        user_msg += "⚠️ Could not generate invite link. Contact admin for manual access."
+
+    try:
+        await context.bot.send_message(uid, user_msg, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Could not notify user {uid}: {e}")
+
+    # Update owner message
+    owner_confirm = (
+        f"✅ <b>Payment Approved</b>\n\n"
+        f"🆔 Request: <code>{request_id}</code>\n"
+        f"👤 @{username} (<code>{uid}</code>)\n"
+        f"📢 {channel_name} | {plan_label}\n"
+        f"💰 ₹{price}\n\n"
+        f"🔗 Invite link sent to user.\n"
+        f"⏱ Link auto-revokes in 1 hour."
+    )
+    try:
+        await query.edit_message_caption(owner_confirm, parse_mode="HTML")
+    except Exception:
+        await query.message.reply_text(owner_confirm, parse_mode="HTML")
+
+
+async def _reject_payment(query, context, request_id: str):
+    req = db.get_payment_request(request_id)
+    if not req:
+        await query.edit_message_caption("⚠️ Payment request not found or already resolved.")
+        return
+    if req["status"] != "pending":
+        await query.edit_message_caption(
+            f"⚠️ This request was already <b>{req['status']}</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    uid      = req["user_id"]
+    username = req.get("username", str(uid))
+    channel_name = req["channel_name"]
+    price    = req.get("amount", 0)
+
+    db.update_payment_status(request_id, "rejected")
+
+    try:
+        await context.bot.send_message(
+            uid,
+            "╔══════════════════════╗\n"
+            "   ❌ <b>PAYMENT REJECTED</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"📢 Channel: <b>{channel_name}</b>\n"
+            f"💰 Amount: <b>₹{price}</b>\n\n"
+            "Your payment could not be verified.\n\n"
+            "❓ <b>Possible reasons:</b>\n"
+            "• Screenshot unclear or invalid\n"
+            "• Wrong amount paid\n"
+            "• Payment not received\n\n"
+            "💬 Contact admin if you believe this is a mistake.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    owner_confirm = (
+        f"❌ <b>Payment Rejected</b>\n\n"
+        f"🆔 Request: <code>{request_id}</code>\n"
+        f"👤 @{username} (<code>{uid}</code>)\n"
+        f"📢 {channel_name} | ₹{price}\n\n"
+        "User has been notified."
+    )
+    try:
+        await query.edit_message_caption(owner_confirm, parse_mode="HTML")
+    except Exception:
+        await query.message.reply_text(owner_confirm, parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
+#  CHAT MEMBER HANDLER
 # ─────────────────────────────────────────────
 
 async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,20 +730,51 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = result.new_chat_member.user
     chat = result.chat
 
-    # ── User joined ───────────────────────────────────────
     if old_status in [ChatMember.LEFT, ChatMember.BANNED] and new_status == ChatMember.MEMBER:
         channel_id = str(chat.id)
         if not db.is_managed_channel(channel_id):
             return
 
-        # Exact Telegram join timestamp
         join_date = result.date
         if join_date.tzinfo is None:
             join_date = join_date.replace(tzinfo=timezone.utc)
 
         username = user.username or user.first_name or str(user.id)
 
-        # Save as pending — do NOT record subscription yet
+        # ── Check if user already has an active subscription ──────────
+        # This happens when user joins via an invite link sent after payment
+        # approval. In that case the subscription is already saved — no need
+        # for another pending approval; just log and return.
+        existing_sub = db.get_subscription(user.id, channel_id)
+        if existing_sub:
+            logger.info(
+                f"User {user.id} joined {channel_id} — subscription already active "
+                f"(plan: {existing_sub.get('months', '?')}M, "
+                f"expiry: {existing_sub.get('expiry_date', '?')}). Skipping pending."
+            )
+            # Notify owner silently so they're aware the user joined
+            try:
+                expiry    = parse_dt(existing_sub["expiry_date"])
+                jd        = parse_dt(existing_sub.get("join_date") or existing_sub.get("created_at") or existing_sub["expiry_date"])
+                ch_name   = existing_sub.get("channel_name", chat.title)
+                await context.bot.send_message(
+                    Config.OWNER_ID,
+                    "✅ <b>Member Joined — Subscription Active</b>\n\n"
+                    f"👤 Name: <b>{user.first_name}</b>\n"
+                    f"🔖 Username: @{username}\n"
+                    f"🆔 User ID: <code>{user.id}</code>\n"
+                    f"📢 Channel: <b>{chat.title}</b>\n"
+                    f"🕐 Joined: <b>{to_ist(join_date).strftime('%d %b %Y %H:%M')} IST</b>\n"
+                    f"📆 Expires: <b>{to_ist(expiry).strftime('%d %b %Y %H:%M')} IST</b>\n"
+                    f"⏳ Remaining: <b>{fmt_remaining(expiry)}</b>\n\n"
+                    "✅ <i>No action needed — subscription was already approved.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Could not send join notice to owner: {e}")
+            return
+        # ─────────────────────────────────────────────────────────────
+
         db.add_pending(
             user_id=user.id,
             channel_id=channel_id,
@@ -309,10 +783,8 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
             join_date=join_date,
             channel_name=chat.title,
         )
-
         logger.info(f"Pending approval: user {user.id} joined {channel_id}")
 
-        # Notify owner with Approve / Reject buttons
         approve_cb = f"apr_approve_{user.id}_{channel_id}"
         reject_cb  = f"apr_reject_{user.id}_{channel_id}"
         keyboard = InlineKeyboardMarkup([[
@@ -327,13 +799,13 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"🆔 User ID: <code>{user.id}</code>\n"
             f"📢 Channel: <b>{chat.title}</b>\n"
             f"🕐 Joined: <b>{to_ist(join_date).strftime('%d %b %Y %H:%M')} IST</b>\n\n"
-            "Please verify payment and approve or reject."
+            "⚠️ This user joined <b>without going through the payment flow</b>.\n"
+            "Please verify payment manually and approve or reject."
         )
         await context.bot.send_message(
             Config.OWNER_ID, text, parse_mode="HTML", reply_markup=keyboard
         )
 
-    # ── User left / was removed ────────────────────────────
     elif old_status == ChatMember.MEMBER and new_status in [ChatMember.LEFT, ChatMember.BANNED]:
         channel_id = str(chat.id)
         if db.is_managed_channel(channel_id):
@@ -352,13 +824,73 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = query.from_user
 
+    # ── PAYMENT FLOW — User ────────────────────────────────
+
+    if data == "pay_start":
+        await _pay_show_channels(query, context)
+
+    elif data == "pay_back_home":
+        keyboard = [
+            [InlineKeyboardButton("📋 My Subscriptions", callback_data="my_subscription")],
+            [InlineKeyboardButton("💳 Buy Subscription", callback_data="pay_start")],
+        ]
+        await query.edit_message_text(
+            "╔══════════════════════╗\n"
+            "   ✨ <b>WELCOME ABOARD!</b> ✨\n"
+            "╚══════════════════════╝\n\n"
+            f"👋 Hello, <b>{user.first_name}</b>!\n\n"
+            "👇 <b>Tap a button below to get started!</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+
+    elif data.startswith("pay_ch_"):
+        channel_id = data[len("pay_ch_"):]
+        await _pay_show_plans(query, context, channel_id)
+
+    elif data.startswith("pay_plan_"):
+        # pay_plan_{channel_id}_{months}_{price}
+        rest   = data[len("pay_plan_"):]
+        parts  = rest.rsplit("_", 2)
+        channel_id = parts[0]
+        months     = int(parts[1])
+        price      = int(parts[2])
+        await _pay_show_qr(query, context, channel_id, months, price)
+
+    elif data == "pay_cancel":
+        context.user_data.clear()
+        await query.message.delete()
+        await query.message.chat.send_message(
+            "❌ Payment cancelled.\n\nTap /start to begin again.",
+            parse_mode="HTML"
+        )
+
+    # ── PAYMENT — Owner Approve / Reject ──────────────────
+
+    elif data.startswith("pmt_approve_") and is_owner(user.id):
+        request_id = data[len("pmt_approve_"):]
+        await _approve_payment(query, context, request_id)
+
+    elif data.startswith("pmt_reject_") and is_owner(user.id):
+        request_id = data[len("pmt_reject_"):]
+        await _reject_payment(query, context, request_id)
+
+    # ── Admin: Payment Requests List ──────────────────────
+
+    elif data == "ap_payments" and is_owner(user.id):
+        await _show_payment_requests(query)
+
     # ── User: My Subscriptions ─────────────────────────────
-    if data == "my_subscription":
+
+    elif data == "my_subscription":
         subs = db.get_user_subscriptions(user.id)
         if not subs:
+            keyboard = [[InlineKeyboardButton("💳 Buy Subscription", callback_data="pay_start")]]
             await query.edit_message_text(
-                "❌ You have no active subscriptions.\n\nJoin a premium channel to get started!",
-                parse_mode="HTML"
+                "❌ You have no active subscriptions yet.\n\n"
+                "Tap below to purchase access!",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
         text = "📋 <b>Your Subscriptions</b>\n\n"
@@ -375,34 +907,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="HTML")
 
     # ── Admin: Back ────────────────────────────────────────
+
     elif data == "ap_back" and is_owner(user.id):
         subs     = db.get_all_subscriptions()
         channels = db.get_managed_channels()
         pending  = db.get_all_pending()
+        payments = db.get_pending_payment_requests()
         active   = [s for s in subs if parse_dt(s["expiry_date"]) > now_utc()]
         text = (
             "🛠 <b>Admin Panel</b>\n\n"
             f"👥 Total active subscribers: <b>{len(active)}</b>\n"
             f"📢 Managed channels: <b>{len(channels)}</b>\n"
-            f"⏳ Pending approvals: <b>{len(pending)}</b>\n\n"
+            f"⏳ Pending join approvals: <b>{len(pending)}</b>\n"
+            f"💳 Pending payments: <b>{len(payments)}</b>\n\n"
             "Choose an action:"
         )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=owner_panel_keyboard())
 
-    # ── Admin: Pending Approvals list ─────────────────────
     elif data == "ap_pending" and is_owner(user.id):
         await _show_pending_list(query)
 
-    # ── Approval flow: owner taps ✅ Approve ──────────────
     elif data.startswith("apr_approve_") and is_owner(user.id):
-        # callback: apr_approve_{user_id}_{channel_id}
         parts = data[len("apr_approve_"):].split("_", 1)
         uid, channel_id = int(parts[0]), parts[1]
         pending = db.get_pending(uid, channel_id)
         if not pending:
             await query.edit_message_text("⚠️ This approval request no longer exists.")
             return
-        # Store in context for the next step
         context.user_data["apr_uid"]          = uid
         context.user_data["apr_channel_id"]   = channel_id
         context.user_data["apr_channel_name"] = pending.get("channel_name", channel_id)
@@ -421,11 +952,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=month_picker_keyboard(uid, channel_id, "apr_months_")
         )
 
-    # ── Approval flow: owner picks months ─────────────────
     elif data.startswith("apr_months_") and is_owner(user.id):
-        # callback: apr_months_{user_id}_{channel_id}_{months}
         rest   = data[len("apr_months_"):]
-        parts  = rest.rsplit("_", 1)          # split off months from the right
+        parts  = rest.rsplit("_", 1)
         months = int(parts[1])
         uid_ch = parts[0].split("_", 1)
         uid, channel_id = int(uid_ch[0]), uid_ch[1]
@@ -448,11 +977,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
         )
 
-    # ── Approval flow: skip screenshot ────────────────────
     elif data == "apr_skip_photo" and is_owner(user.id):
         await _finish_approval(update, context, photo_file_id=None)
 
-    # ── Approval flow: owner taps ❌ Reject ───────────────
     elif data.startswith("apr_reject_") and is_owner(user.id):
         parts      = data[len("apr_reject_"):].split("_", 1)
         uid, channel_id = int(parts[0]), parts[1]
@@ -460,14 +987,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch_name = pending.get("channel_name", channel_id) if pending else channel_id
         uname   = pending.get("username", str(uid)) if pending else str(uid)
 
-        # Kick from channel
         try:
             await context.bot.ban_chat_member(channel_id, uid)
             await context.bot.unban_chat_member(channel_id, uid)
         except Exception as e:
             logger.warning(f"Could not kick {uid} from {channel_id}: {e}")
 
-        # Notify user
         try:
             await context.bot.send_message(
                 uid,
@@ -480,13 +1005,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         db.remove_pending(uid, channel_id)
-
         await query.edit_message_text(
             f"❌ Rejected and kicked @{uname} (<code>{uid}</code>) from <b>{ch_name}</b>.",
             parse_mode="HTML"
         )
 
-    # ── Admin: All Users ───────────────────────────────────
     elif data == "ap_users" and is_owner(user.id):
         await _show_users_list(query)
 
@@ -494,16 +1017,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split("_")[-1])
         await _show_users_list(query, page=page)
 
-    # ── Admin: User detail ─────────────────────────────────
     elif data.startswith("ap_user_") and is_owner(user.id):
         uid = int(data.split("_")[2])
         await _show_user_detail(query, uid)
 
-    # ── Admin: Channels ────────────────────────────────────
     elif data == "ap_channels" and is_owner(user.id):
         await _show_channels(query)
 
-    # ── Admin: Add/Extend — pick channel ──────────────────
     elif data == "ap_add_start" and is_owner(user.id):
         context.user_data.clear()
         channels = db.get_managed_channels()
@@ -538,7 +1058,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data["awaiting"] = "user_id"
 
-    # ── Admin: Extend from user detail ────────────────────
     elif data.startswith("ap_extend_") and is_owner(user.id):
         parts      = data.split("_")
         uid        = int(parts[2])
@@ -557,7 +1076,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data["awaiting"] = "extend_months"
 
-    # ── Admin: Remove sub from detail ─────────────────────
     elif data.startswith("ap_removesub_") and is_owner(user.id):
         parts      = data.split("_")
         uid        = int(parts[2])
@@ -582,7 +1100,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="ap_users")]])
         )
 
-    # ── Admin: Broadcast prompt ────────────────────────────
     elif data == "ap_broadcast_prompt" and is_owner(user.id):
         await query.edit_message_text(
             "📣 <b>Broadcast</b>\n\nUse command:\n<code>/broadcast Your message here</code>",
@@ -590,14 +1107,83 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="ap_back")]])
         )
 
-    # ── Admin: Skip screenshot (add/extend flow) ──────────
     elif data == "ap_skip_photo" and is_owner(user.id):
         await _finish_add_sub(update, context, photo_file_id=None)
+
+    # ── /setpayment — Update UPI ID ───────────────────────
+    elif data == "setpay_upi" and is_owner(user.id):
+        context.user_data["awaiting"] = "setpay_upi"
+        await query.edit_message_text(
+            "💳 <b>Update UPI ID</b>\n\n"
+            f"Current: <code>{Config.UPI_ID or 'Not set'}</code>\n\n"
+            "Send your new UPI ID now:\n"
+            "<i>Example: yourname@upi</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="setpay_cancel")
+            ]])
+        )
+
+    elif data == "setpay_qr" and is_owner(user.id):
+        context.user_data["awaiting"] = "setpay_qr"
+        await query.edit_message_text(
+            "🖼 <b>Update QR Code</b>\n\n"
+            "Send your new UPI QR code image now.\n\n"
+            "💡 <i>The bot will store it automatically.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="setpay_cancel")
+            ]])
+        )
+
+    elif data == "setpay_cancel" and is_owner(user.id):
+        context.user_data.pop("awaiting", None)
+        current_upi = Config.UPI_ID or "Not set"
+        qr_status   = "✅ Set" if Config.UPI_QR_FILE_ID else "❌ Not set"
+        await query.edit_message_text(
+            "╔══════════════════════╗\n"
+            "   ⚙️ <b>PAYMENT SETTINGS</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"💳 Current UPI ID: <code>{current_upi}</code>\n"
+            f"🖼 QR Code: {qr_status}\n\n"
+            "What do you want to update?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Update UPI ID",  callback_data="setpay_upi")],
+                [InlineKeyboardButton("🖼 Update QR Code", callback_data="setpay_qr")],
+            ])
+        )
 
 
 # ─────────────────────────────────────────────
 #  ADMIN PANEL HELPERS
 # ─────────────────────────────────────────────
+
+async def _show_payment_requests(query):
+    payments = db.get_pending_payment_requests()
+    if not payments:
+        await query.edit_message_text(
+            "✅ No pending payment requests.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="ap_back")]])
+        )
+        return
+    text = f"💳 <b>Pending Payments</b> ({len(payments)})\n\n"
+    keyboard = []
+    for p in payments:
+        plan_label = next((l for l, m, pr in PLANS if m == p["months"] and pr == p["amount"]), f"{p['months']}M")
+        uname = p.get("username", str(p["user_id"]))
+        text += (
+            f"🆔 <code>{p['request_id']}</code>\n"
+            f"👤 @{uname} | 📢 {p['channel_name']}\n"
+            f"📅 {plan_label} | 💰 ₹{p['amount']}\n\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(f"✅ {p['request_id']}", callback_data=f"pmt_approve_{p['request_id']}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"pmt_reject_{p['request_id']}"),
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="ap_back")])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def _show_pending_list(query):
     pending_list = db.get_all_pending()
@@ -735,7 +1321,6 @@ async def _show_channels(query):
 
 async def _finish_approval(update_or_query, context: ContextTypes.DEFAULT_TYPE,
                            photo_file_id: str = None):
-    """Finalise owner approval — save subscription, notify user & owner."""
     data        = context.user_data
     uid         = data["apr_uid"]
     channel_id  = data["apr_channel_id"]
@@ -747,7 +1332,6 @@ async def _finish_approval(update_or_query, context: ContextTypes.DEFAULT_TYPE,
     join_date = parse_dt(raw_join) if raw_join else now_utc()
     expiry    = join_date + timedelta(days=30 * months)
 
-    # Check if already has a subscription (re-join case)
     existing = db.get_subscription(uid, channel_id)
     if existing:
         current_expiry = parse_dt(existing["expiry_date"])
@@ -759,11 +1343,9 @@ async def _finish_approval(update_or_query, context: ContextTypes.DEFAULT_TYPE,
         db.add_subscription(uid, channel_id, expiry, username, join_date=join_date)
         caption = "🎉 <b>Subscription Approved!</b>"
 
-    # Remove from pending
     db.remove_pending(uid, channel_id)
     context.user_data.clear()
 
-    # Notify user
     try:
         await send_sub_info(
             context.bot, uid,
@@ -776,7 +1358,6 @@ async def _finish_approval(update_or_query, context: ContextTypes.DEFAULT_TYPE,
     except Exception as e:
         logger.warning(f"Could not notify user {uid}: {e}")
 
-    # Confirm to owner
     await send_sub_info(
         context.bot, Config.OWNER_ID,
         username=username, user_id=uid,
@@ -788,7 +1369,7 @@ async def _finish_approval(update_or_query, context: ContextTypes.DEFAULT_TYPE,
 
 
 # ─────────────────────────────────────────────
-#  ADD/EXTEND SUB FLOW FINISH (manual /admin flow)
+#  ADD/EXTEND SUB FLOW FINISH
 # ─────────────────────────────────────────────
 
 async def _finish_add_sub(update_or_query, context: ContextTypes.DEFAULT_TYPE,
@@ -868,7 +1449,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # ── Step 1: User ID (add/extend flow) ─────────────────
     if awaiting == "user_id":
         if not text.isdigit():
             await update.message.reply_text("❗ Please send a valid numeric Telegram User ID.")
@@ -900,7 +1480,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["add_action"] = "new"
         context.user_data["awaiting"] = "months"
 
-    # ── Step 2: Months (add/extend flow) ──────────────────
     elif awaiting in ("months", "extend_months"):
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❗ Please send a valid number of months (e.g. 1, 3, 6).")
@@ -917,9 +1496,6 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]])
         )
 
-    # Step 3 handled by photo handlers below
-
-    # ── Set-join-date flow: months ────────────────────────
     elif awaiting == "sjd_months":
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("❗ Please send a valid number of months (e.g. 1, 3, 6, 12).")
@@ -928,32 +1504,63 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting"]   = None
         await _finish_set_join_date(update, context)
 
+    elif awaiting == "setpay_upi":
+        context.user_data.pop("awaiting", None)
+        new_upi = text.strip()
+        # Update in-memory config
+        Config.UPI_ID = new_upi
+        global UPI_ID
+        UPI_ID = new_upi
+        await update.message.reply_text(
+            "✅ <b>UPI ID Updated!</b>\n\n"
+            f"💳 New UPI ID: <code>{new_upi}</code>\n\n"
+            "⚠️ <i>This is temporary — add it to your .env to make it permanent:</i>\n"
+            f"<code>UPI_ID={new_upi}</code>",
+            parse_mode="HTML"
+        )
+
 
 async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Payment screenshot from owner."""
-    if not is_owner(update.effective_user.id):
-        return
+    """Photos from owner (during admin flows) or users (payment screenshots)."""
+    user = update.effective_user
 
-    awaiting = context.user_data.get("awaiting")
-    photo    = update.message.photo[-1]
+    if is_owner(user.id):
+        awaiting = context.user_data.get("awaiting")
+        photo    = update.message.photo[-1]
 
-    if awaiting == "apr_photo":
-        # Approval flow screenshot
-        context.user_data["awaiting"] = None
-        await _finish_approval(update, context, photo_file_id=photo.file_id)
-
-    elif awaiting == "photo":
-        # Manual add/extend flow screenshot
-        context.user_data["awaiting"] = None
-        await _finish_add_sub(update, context, photo_file_id=photo.file_id)
+        if awaiting == "apr_photo":
+            context.user_data["awaiting"] = None
+            await _finish_approval(update, context, photo_file_id=photo.file_id)
+        elif awaiting == "photo":
+            context.user_data["awaiting"] = None
+            await _finish_add_sub(update, context, photo_file_id=photo.file_id)
+        elif awaiting == "setpay_qr":
+            context.user_data.pop("awaiting", None)
+            new_file_id = photo.file_id
+            # Update in-memory config
+            Config.UPI_QR_FILE_ID = new_file_id
+            global QR_FILE_ID
+            QR_FILE_ID = new_file_id
+            await update.message.reply_text(
+                "✅ <b>QR Code Updated!</b>\n\n"
+                "🖼 New QR code is now active and will be shown to users during payment.\n\n"
+                "⚠️ <i>This is temporary — add it to your .env to make it permanent:</i>\n"
+                f"<code>UPI_QR_FILE_ID={new_file_id}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            # Owner sent a photo outside any flow — ignore
+            pass
+    else:
+        # Non-owner — handle payment screenshot
+        await handle_user_payment_screenshot(update, context)
 
 
 # ─────────────────────────────────────────────
-#  /setjoindate — Manual join date setter
+#  /setjoindate
 # ─────────────────────────────────────────────
 
 async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /setjoindate <user_id> <channel_id> <DD-MM-YYYY>  — then bot asks for months"""
     if not is_owner(update.effective_user.id):
         return
     args = context.args
@@ -993,7 +1600,6 @@ async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username     = (user_info.username or user_info.first_name or str(uid)) if user_info else str(uid)
     first_name   = user_info.first_name if user_info else ""
 
-    # Save state and ask for subscription period
     context.user_data["sjd_uid"]          = uid
     context.user_data["sjd_channel_id"]   = channel_id
     context.user_data["sjd_channel_name"] = channel_name
@@ -1017,7 +1623,6 @@ async def set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _finish_set_join_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Finalise set-join-date flow — save join date + recalculated expiry."""
     data         = context.user_data
     uid          = data["sjd_uid"]
     channel_id   = data["sjd_channel_id"]
@@ -1060,7 +1665,6 @@ async def _finish_set_join_date(update: Update, context: ContextTypes.DEFAULT_TY
 # ─────────────────────────────────────────────
 
 async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /addchannel <channel_id> <plan_months> <channel_name>"""
     if not is_owner(update.effective_user.id):
         return
     args = context.args
@@ -1103,7 +1707,6 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /addsub <user_id> <channel_id> <months>  — quick command, no screenshot"""
     if not is_owner(update.effective_user.id):
         return
     args = context.args
@@ -1231,7 +1834,7 @@ async def check_expiring_subscriptions(context: ContextTypes.DEFAULT_TYPE):
                 channel_name=channel_name,
                 join_date=join_date, expiry=expiry,
                 first_name=first_name,
-                extra_caption="⚠️ <b>Subscription Expiring Soon!</b>\nPlease contact the admin to renew."
+                extra_caption="⚠️ <b>Subscription Expiring Soon!</b>\nPlease renew via /start → Buy Subscription."
             )
             db.mark_notified(sub["user_id"], sub["channel_id"], "3d")
         except Exception as e:
@@ -1249,7 +1852,6 @@ async def check_expiring_subscriptions(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # ── 1-day warning — owner only ─────────────────────────
     for sub in db.get_expiring_subscriptions_1d():
         expiry       = parse_dt(sub["expiry_date"])
         channel_name = sub.get("channel_name", sub["channel_id"])
@@ -1284,7 +1886,7 @@ async def check_expiring_subscriptions(context: ContextTypes.DEFAULT_TYPE):
                 channel_name=channel_name,
                 join_date=join_date, expiry=expiry,
                 first_name=first_name,
-                extra_caption="❌ <b>Subscription Expired!</b>\nContact the admin to renew."
+                extra_caption="❌ <b>Subscription Expired!</b>\nContact the admin to renew via /start → Buy Subscription."
             )
         except Exception:
             pass
@@ -1309,6 +1911,34 @@ async def check_expiring_subscriptions(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  /setpayment — Update UPI ID or QR Code
+# ─────────────────────────────────────────────
+
+async def set_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner command to update UPI ID or QR code on the fly."""
+    if not is_owner(update.effective_user.id):
+        return
+
+    current_upi = Config.UPI_ID or "Not set"
+    qr_status   = "✅ Set" if Config.UPI_QR_FILE_ID else "❌ Not set"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Update UPI ID",    callback_data="setpay_upi")],
+        [InlineKeyboardButton("🖼 Update QR Code",   callback_data="setpay_qr")],
+    ])
+    await update.message.reply_text(
+        "╔══════════════════════╗\n"
+        "   ⚙️ <b>PAYMENT SETTINGS</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"💳 Current UPI ID: <code>{current_upi}</code>\n"
+        f"🖼 QR Code: {qr_status}\n\n"
+        "What do you want to update?",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
@@ -1327,17 +1957,15 @@ def main():
     app.add_handler(CommandHandler("setjoindate",   set_join_date))
     app.add_handler(CommandHandler("listsubs",      list_subs))
     app.add_handler(CommandHandler("broadcast",     broadcast))
+    app.add_handler(CommandHandler("setpayment",    set_payment))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(ChatMemberHandler(chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
-    # Photo handler — owner only, during any flow step
-    app.add_handler(MessageHandler(
-        filters.PHOTO & filters.User(Config.OWNER_ID),
-        handle_photo_input
-    ))
+    # Photo handler — owner admin flows + user payment screenshots
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_input))
 
-    # Text handler — owner only, during multi-step flows
+    # Text handler — owner only, multi-step flows
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(Config.OWNER_ID),
         handle_text_input
