@@ -40,8 +40,9 @@ PLANS = [
 # ─────────────────────────────────────────────
 #  UPI CONFIG  ← SET YOUR UPI ID & QR HERE
 # ─────────────────────────────────────────────
-UPI_ID   = Config.UPI_ID        # set in .env: UPI_ID=yourname@upi
-QR_FILE_ID = Config.UPI_QR_FILE_ID  # set in .env after sending QR to bot once
+# UPI settings are loaded from MongoDB on startup (set via /setpayment)
+UPI_ID     = ""   # populated in main() from db
+QR_URL = ""   # populated in main() from db — image URL for UPI QR code
 
 
 # ─────────────────────────────────────────────
@@ -447,19 +448,28 @@ async def _pay_show_qr(query, context, channel_id: str, months: int, price: int)
         InlineKeyboardButton("❌ Cancel", callback_data="pay_cancel")
     ]])
 
-    try:
-        # Delete old message and send QR as photo
-        await query.message.delete()
+    if QR_URL:
+        # QR URL is set — delete old message and send photo via URL
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await query.message.chat.send_photo(
-            photo=QR_FILE_ID,
+            photo=QR_URL,
             caption=caption,
             parse_mode="HTML",
             reply_markup=keyboard
         )
-    except Exception:
-        # Fallback: just edit if delete fails
+    else:
+        # QR not set — send text only
+        no_qr_note = (
+            "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ <b>QR code not configured yet.</b>\n"
+            "Please pay directly to the UPI ID above.\n"
+            "Use /setpayment to add your QR image URL."
+        )
         await query.edit_message_text(
-            caption + f"\n\n📷 <i>(QR code not set — pay to UPI ID above)</i>",
+            caption + no_qr_note,
             parse_mode="HTML",
             reply_markup=keyboard
         )
@@ -1127,9 +1137,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "setpay_qr" and is_owner(user.id):
         context.user_data["awaiting"] = "setpay_qr"
         await query.edit_message_text(
-            "🖼 <b>Update QR Code</b>\n\n"
-            "Send your new UPI QR code image now.\n\n"
-            "💡 <i>The bot will store it automatically.</i>",
+            "🖼 <b>Update QR Code URL</b>\n\n"
+            "Send the <b>image URL</b> of your UPI QR code.\n\n"
+            "Example:\n"
+            "<code>https://example.com/my-qr-code.png</code>\n\n"
+            "💡 <i>You can upload your QR image to any image host\n"
+            "(imgbb.com, imgur.com, etc.) and paste the direct link here.</i>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Cancel", callback_data="setpay_cancel")
@@ -1139,7 +1152,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "setpay_cancel" and is_owner(user.id):
         context.user_data.pop("awaiting", None)
         current_upi = Config.UPI_ID or "Not set"
-        qr_status   = "✅ Set" if Config.UPI_QR_FILE_ID else "❌ Not set"
+        qr_status   = "✅ Set" if (Config.UPI_QR_FILE_ID or QR_URL) else "❌ Not set"
         await query.edit_message_text(
             "╔══════════════════════╗\n"
             "   ⚙️ <b>PAYMENT SETTINGS</b>\n"
@@ -1504,18 +1517,41 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting"]   = None
         await _finish_set_join_date(update, context)
 
+    elif awaiting == "setpay_qr":
+        context.user_data.pop("awaiting", None)
+        url = text.strip()
+        if not url.startswith("http"):
+            await update.message.reply_text(
+                "❗ That doesn't look like a valid URL.\n"
+                "Please send a direct image URL starting with <code>https://</code>",
+                parse_mode="HTML"
+            )
+            context.user_data["awaiting"] = "setpay_qr"
+            return
+        db.set_setting("upi_qr_url", url)
+        Config.UPI_QR_FILE_ID = url
+        global QR_URL
+        QR_URL = url
+        await update.message.reply_text(
+            "✅ <b>QR Code URL Updated!</b>\n\n"
+            f"🔗 URL: <code>{url}</code>\n\n"
+            "🖼 QR code is now active and will be shown to users during payment.\n"
+            "💾 <i>Saved to database — persists after restart.</i>",
+            parse_mode="HTML"
+        )
+
     elif awaiting == "setpay_upi":
         context.user_data.pop("awaiting", None)
         new_upi = text.strip()
-        # Update in-memory config
+        # Save to DB + update in-memory
+        db.set_setting("upi_id", new_upi)
         Config.UPI_ID = new_upi
         global UPI_ID
         UPI_ID = new_upi
         await update.message.reply_text(
             "✅ <b>UPI ID Updated!</b>\n\n"
             f"💳 New UPI ID: <code>{new_upi}</code>\n\n"
-            "⚠️ <i>This is temporary — add it to your .env to make it permanent:</i>\n"
-            f"<code>UPI_ID={new_upi}</code>",
+            "💾 <i>Saved to database — active immediately and persists after restart.</i>",
             parse_mode="HTML"
         )
 
@@ -1535,22 +1571,20 @@ async def handle_photo_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["awaiting"] = None
             await _finish_add_sub(update, context, photo_file_id=photo.file_id)
         elif awaiting == "setpay_qr":
-            context.user_data.pop("awaiting", None)
-            new_file_id = photo.file_id
-            # Update in-memory config
-            Config.UPI_QR_FILE_ID = new_file_id
-            global QR_FILE_ID
-            QR_FILE_ID = new_file_id
+            # User sent a photo but we now expect a URL — guide them
             await update.message.reply_text(
-                "✅ <b>QR Code Updated!</b>\n\n"
-                "🖼 New QR code is now active and will be shown to users during payment.\n\n"
-                "⚠️ <i>This is temporary — add it to your .env to make it permanent:</i>\n"
-                f"<code>UPI_QR_FILE_ID={new_file_id}</code>",
+                "⚠️ Please send the <b>image URL</b> of your QR code, not the image itself.\n\n"
+                "Upload your QR image to imgbb.com or imgur.com and paste the direct link here.\n\n"
+                "Example: <code>https://i.imgur.com/abc123.png</code>",
                 parse_mode="HTML"
             )
         else:
-            # Owner sent a photo outside any flow — ignore
-            pass
+            # Owner sent a photo outside any flow — guide to use URL instead
+            await update.message.reply_text(
+                "💡 To update your QR code, use /setpayment → Update QR Code\n\n"
+                "You'll be asked to paste a direct image URL instead of uploading a photo.",
+                parse_mode="HTML"
+            )
     else:
         # Non-owner — handle payment screenshot
         await handle_user_payment_screenshot(update, context)
@@ -1920,7 +1954,7 @@ async def set_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     current_upi = Config.UPI_ID or "Not set"
-    qr_status   = "✅ Set" if Config.UPI_QR_FILE_ID else "❌ Not set"
+    qr_status   = "✅ Set" if (Config.UPI_QR_FILE_ID or QR_URL) else "❌ Not set"
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Update UPI ID",    callback_data="setpay_upi")],
@@ -1944,6 +1978,18 @@ async def set_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
+
+    # Load UPI settings from DB into globals
+    global UPI_ID, QR_FILE_ID
+    UPI_ID     = db.get_setting("upi_id", "") or ""
+    QR_URL = db.get_setting("upi_qr_url", "") or Config.UPI_QR_FILE_ID or ""
+    Config.UPI_ID         = UPI_ID
+    Config.UPI_QR_FILE_ID = QR_URL
+    if not UPI_ID:
+        print("⚠️  UPI ID not set — use /setpayment to configure it.")
+    if not QR_URL:
+        print("⚠️  UPI QR URL not set — use /setpayment to configure it.")
+
     app = Application.builder().token(Config.BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",         start))
@@ -1975,6 +2021,7 @@ def main():
 
     logger.info("Bot started...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
