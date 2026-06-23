@@ -64,6 +64,39 @@ def parse_dt(raw) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def fmt_ist_full(dt: datetime) -> str:
+    """Format a datetime as '06 Sep 2026, 08:33 AM (IST)'."""
+    return to_ist(dt).strftime('%d %b %Y, %I:%M %p') + " (IST)"
+
+
+def parse_duration(text: str):
+    """
+    Parse a duration string like '5', '5d', '5 days', '2m', '2 months' into
+    (amount, unit) where unit is 'days' or 'months'.
+    Returns None if the text is not a valid duration.
+    """
+    import re
+    match = re.match(r'^\s*(\d+)\s*(d|day|days|m|mo|month|months)?\s*$', text.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    if amount < 1:
+        return None
+    suffix = (match.group(2) or "").lower()
+    unit = "days" if suffix.startswith("d") else "months"
+    return amount, unit
+
+
+def duration_to_timedelta(amount: int, unit: str) -> timedelta:
+    return timedelta(days=amount) if unit == "days" else timedelta(days=30 * amount)
+
+
+def duration_label(amount: int, unit: str) -> str:
+    if unit == "days":
+        return f"{amount} day{'s' if amount != 1 else ''}"
+    return f"{amount} month{'s' if amount != 1 else ''}"
+
+
 def fmt_remaining(expiry: datetime) -> str:
     delta = expiry - now_utc()
     total_seconds = int(delta.total_seconds())
@@ -1080,7 +1113,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔧 <b>Extend Subscription</b>\n\n"
             f"👤 User ID: <code>{uid}</code>\n"
             f"📢 Channel: <b>{context.user_data['add_channel_name']}</b>\n\n"
-            "How many <b>months</b> to add?",
+            "How long to add? Send a number of <b>months</b> (e.g. <code>2</code>) "
+            "or <b>days</b> (e.g. <code>5d</code>).",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"ap_user_{uid}")]])
         )
@@ -1391,42 +1425,62 @@ async def _finish_add_sub(update_or_query, context: ContextTypes.DEFAULT_TYPE,
     uid          = data["add_user_id"]
     channel_id   = data["add_channel_id"]
     channel_name = data["add_channel_name"]
-    months       = data["add_months"]
+    amount       = data.get("add_amount", data.get("add_months"))
+    unit         = data.get("add_unit", "months")
     action       = data.get("add_action", "new")
+    delta        = duration_to_timedelta(amount, unit)
 
     user_info = await get_user_info(context, uid)
     username  = (user_info.username or user_info.first_name or str(uid)) if user_info else str(uid)
 
+    previous_expiry = None
     if action == "extend":
         existing = db.get_subscription(uid, channel_id)
         if existing:
-            current_expiry = parse_dt(existing["expiry_date"])
-            base   = current_expiry if current_expiry > now_utc() else now_utc()
+            current_expiry  = parse_dt(existing["expiry_date"])
+            previous_expiry = current_expiry
+            base = current_expiry if current_expiry > now_utc() else now_utc()
         else:
             base = now_utc()
-        new_expiry = base + timedelta(days=30 * months)
+        new_expiry = base + delta
         db.update_subscription_expiry(uid, channel_id, new_expiry)
         join_date      = parse_dt(existing["join_date"]) if existing and existing.get("join_date") else now_utc()
         caption_prefix = "🔄 <b>Subscription Extended!</b>"
     else:
-        new_expiry     = now_utc() + timedelta(days=30 * months)
+        new_expiry     = now_utc() + delta
         join_date      = now_utc()
         db.add_subscription(uid, channel_id, new_expiry, username, join_date=join_date)
         caption_prefix = "🎉 <b>Subscription Added!</b>"
 
     context.user_data.clear()
 
-    try:
-        await send_sub_info(
-            context.bot, uid,
-            username=username, user_id=uid,
-            channel_name=channel_name,
-            join_date=join_date, expiry=new_expiry,
-            photo_file_id=photo_file_id,
-            extra_caption=caption_prefix
+    if action == "extend":
+        extension_msg = (
+            "🔄 <b>Subscription Extension Update</b>\n\n"
+            f"We have extended your active premium plan by <b>{duration_label(amount, unit)}</b>.\n\n"
+            f"📆 Previous expiry: <b>{fmt_ist_full(previous_expiry) if previous_expiry else 'N/A'}</b>\n"
+            f"📆 New expiry: <b>{fmt_ist_full(new_expiry)}</b>\n\n"
+            "Thank you for staying with us. 🙏"
         )
-    except Exception as e:
-        logger.warning(f"Could not notify user {uid}: {e}")
+        try:
+            if photo_file_id:
+                await context.bot.send_photo(chat_id=uid, photo=photo_file_id, caption=extension_msg, parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=uid, text=extension_msg, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Could not notify user {uid}: {e}")
+    else:
+        try:
+            await send_sub_info(
+                context.bot, uid,
+                username=username, user_id=uid,
+                channel_name=channel_name,
+                join_date=join_date, expiry=new_expiry,
+                photo_file_id=photo_file_id,
+                extra_caption=caption_prefix
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify user {uid}: {e}")
 
     await send_sub_info(
         context.bot, Config.OWNER_ID,
@@ -1439,7 +1493,7 @@ async def _finish_add_sub(update_or_query, context: ContextTypes.DEFAULT_TYPE,
 
     confirm = (
         f"✅ {'Extended' if action == 'extend' else 'Added'} subscription for "
-        f"<code>{uid}</code> (@{username})\n"
+        f"<code>{uid}</code> (@{username}) by <b>{duration_label(amount, unit)}</b>\n"
         f"📢 {channel_name} — expires <b>{to_ist(new_expiry).strftime('%d %b %Y')}</b>"
     )
     if hasattr(update_or_query, 'callback_query'):
@@ -1479,7 +1533,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 User: <b>{name}</b> (<code>{uid}</code>)\n"
                 f"📢 Channel: <b>{context.user_data['add_channel_name']}</b>\n\n"
                 f"⚠️ Already subscribed — expires <b>{to_ist(expiry).strftime('%d %b %Y')}</b> ({fmt_remaining(expiry)} left)\n\n"
-                "How many <b>months</b> to extend?",
+                "How long to extend? Send a number of <b>months</b> (e.g. <code>2</code>) "
+                "or <b>days</b> (e.g. <code>5d</code>).",
                 parse_mode="HTML"
             )
             context.user_data["add_action"] = "extend"
@@ -1487,17 +1542,25 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"👤 User: <b>{name}</b> (<code>{uid}</code>)\n"
                 f"📢 Channel: <b>{context.user_data['add_channel_name']}</b>\n\n"
-                "How many <b>months</b> for this subscription?",
+                "How long should this subscription last? Send a number of <b>months</b> "
+                "(e.g. <code>1</code>) or <b>days</b> (e.g. <code>5d</code>).",
                 parse_mode="HTML"
             )
             context.user_data["add_action"] = "new"
         context.user_data["awaiting"] = "months"
 
     elif awaiting in ("months", "extend_months"):
-        if not text.isdigit() or int(text) < 1:
-            await update.message.reply_text("❗ Please send a valid number of months (e.g. 1, 3, 6).")
+        parsed = parse_duration(text)
+        if not parsed:
+            await update.message.reply_text(
+                "❗ Please send a valid duration — a number of months (e.g. 1, 3, 6) "
+                "or days with a 'd' suffix (e.g. 5d, 10d)."
+            )
             return
-        context.user_data["add_months"] = int(text)
+        amount, unit = parsed
+        context.user_data["add_amount"] = amount
+        context.user_data["add_unit"]   = unit
+        context.user_data["add_months"] = amount  # kept for backward-compat references
         context.user_data["awaiting"]   = "photo"
 
         await update.message.reply_text(
