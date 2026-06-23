@@ -1456,11 +1456,16 @@ async def _finish_add_sub(update_or_query, context: ContextTypes.DEFAULT_TYPE,
 
     if action == "extend":
         extension_msg = (
-            "🔄 <b>Subscription Extension Update</b>\n\n"
-            f"We have extended your active premium plan by <b>{duration_label(amount, unit)}</b>.\n\n"
-            f"📆 Previous expiry: <b>{fmt_ist_full(previous_expiry) if previous_expiry else 'N/A'}</b>\n"
-            f"📆 New expiry: <b>{fmt_ist_full(new_expiry)}</b>\n\n"
-            "Thank you for staying with us. 🙏"
+            "🔔 <b>Subscription Extension Notice</b> 🔔\n\n"
+            f"Dear Subscriber <b>@{username}</b>,\n\n"
+            "We would like to formally inform you that your premium subscription has been extended. 🎉\n\n"
+            f"📢 <b>Channel:</b> {channel_name}\n"
+            f"⏳ <b>Extension Duration:</b> {duration_label(amount, unit)}\n"
+            f"📆 <b>Previous Expiry:</b> {fmt_ist_full(previous_expiry) if previous_expiry else 'N/A'}\n"
+            f"📆 <b>New Expiry:</b> {fmt_ist_full(new_expiry)}\n\n"
+            "We sincerely appreciate your continued trust in our service. 🙏\n\n"
+            "Warm regards,\n"
+            "<b>VM-MRx, Marathi_Serialsx Management Team</b>"
         )
         try:
             if photo_file_id:
