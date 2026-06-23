@@ -310,6 +310,38 @@ async def my_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+#  /myplan
+# ─────────────────────────────────────────────
+
+async def my_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    subs = db.get_user_subscriptions(user.id)
+
+    if not subs:
+        await update.message.reply_text(
+            "🔔 <b>Plan Status</b> 🔔\n\n"
+            "❌ You don't have any active subscription.\n\n"
+            "💳 Tap /pay to subscribe to a premium channel!",
+            parse_mode="HTML"
+        )
+        return
+
+    text = "🔔 <b>Plan Status</b> 🔔\n\n"
+    for sub in subs:
+        expiry    = parse_dt(sub["expiry_date"])
+        join_date = parse_dt(sub.get("join_date") or sub.get("created_at") or sub["expiry_date"])
+        emoji     = status_emoji(expiry)
+        text += (
+            f"{emoji} <b>{sub.get('channel_name', 'Unknown')}</b>\n"
+            f"📆 Joined On: {fmt_ist_full(join_date)}\n"
+            f"📆 Expiry Date: {fmt_ist_full(expiry)}\n"
+            f"⏳ Time Remaining: {fmt_remaining(expiry)}\n\n"
+        )
+    text += "Thank you for being a valued subscriber. 🙏"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
 #  /help
 # ─────────────────────────────────────────────
 
@@ -318,7 +350,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📋 <b>Available Commands</b>\n\n"
             "🔹 /start — Welcome screen & buy subscription\n"
-            "🔹 /mysubs — View your subscriptions",
+            "🔹 /pay — Start buying/renewing a subscription\n"
+            "🔹 /mysubs — View your subscriptions\n"
+            "🔹 /myplan — Check your active plan & expiry date",
             parse_mode="HTML"
         )
         return
@@ -340,6 +374,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   <i>Set or correct a user's join date</i>\n\n"
         "📋 /listsubs [channel_id]\n"
         "   <i>List all or per-channel subscribers</i>\n\n"
+        "━━━ 💳 <b>Payments</b> ━━━\n"
+        "💸 /pay\n"
+        "   <i>Preview the buy-subscription flow as a user would see it</i>\n\n"
+        "🧾 /setpayment\n"
+        "   <i>Update your UPI ID and QR code image</i>\n\n"
         "━━━ 🛠 <b>Admin Panel</b> ━━━\n"
         "🖥 /admin — Interactive admin panel\n\n"
         "━━━ 📣 <b>Broadcast</b> ━━━\n"
@@ -2243,6 +2282,7 @@ def main():
     app.add_handler(CommandHandler("start",         start))
     app.add_handler(CommandHandler("pay",           pay_command))
     app.add_handler(CommandHandler("mysubs",        my_subscriptions))
+    app.add_handler(CommandHandler("myplan",        my_plan))
     app.add_handler(CommandHandler("help",          help_command))
     app.add_handler(CommandHandler("admin",         admin_panel))
     app.add_handler(CommandHandler("addchannel",    add_channel))
