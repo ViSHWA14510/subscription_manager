@@ -118,6 +118,12 @@ class Database:
             {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
         )
 
+    def update_payment_screenshot(self, request_id: str, screenshot_file_id: str):
+        self.payment_requests.update_one(
+            {"request_id": request_id},
+            {"$set": {"screenshot_file_id": screenshot_file_id}}
+        )
+
     def get_user_pending_payment(self, user_id: int, channel_id: str) -> Optional[Dict]:
         return self.payment_requests.find_one(
             {"user_id": user_id, "channel_id": channel_id, "status": "pending"},
