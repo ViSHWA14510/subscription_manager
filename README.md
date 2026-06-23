@@ -96,6 +96,7 @@ Where:
 | `/start` | Welcome screen — buy a subscription or check your status |
 | `/pay` | Start the buy/renew flow directly: pick channel → pick plan → pay via QR |
 | `/mysubs` | View your active subscriptions |
+| `/myplan` | Check your active plan and expiry date |
 | `/help` | Show available commands |
 
 ---
