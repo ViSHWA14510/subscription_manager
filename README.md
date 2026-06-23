@@ -76,12 +76,16 @@ Where:
 
 | Command | Description |
 |---|---|
+| `/admin` | Open the interactive admin panel |
 | `/addchannel <channel_id> <months> <name>` | Register a channel for subscription tracking |
 | `/removechannel <channel_id>` | Stop managing a channel |
-| `/addsub <user_id> <channel_id> <months>` | Manually add a subscription |
+| `/addsub <user_id> <channel_id> <months>` | Manually add/extend a subscription |
 | `/removesub <user_id> <channel_id>` | Remove a subscription and kick user |
+| `/setjoindate <user_id> <channel_id> <DD-MM-YYYY>` | Set or correct a user's join date |
 | `/listsubs [channel_id]` | List all (or per-channel) subscriptions |
 | `/broadcast <message>` | Send a message to all subscribers |
+| `/setpayment` | Update your UPI ID and QR code image |
+| `/help` | Show the full command reference |
 
 ---
 
@@ -89,7 +93,10 @@ Where:
 
 | Command | Description |
 |---|---|
-| `/start` | Show subscription status / owner panel |
+| `/start` | Welcome screen — buy a subscription or check your status |
+| `/pay` | Start the buy/renew flow directly: pick channel → pick plan → pay via QR |
+| `/mysubs` | View your active subscriptions |
+| `/help` | Show available commands |
 
 ---
 
