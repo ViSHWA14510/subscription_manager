@@ -378,6 +378,31 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  PAYMENT FLOW — User side
 # ─────────────────────────────────────────────
 
+async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pay — entry point that kicks off the buy-subscription flow."""
+    channels = db.get_managed_channels()
+    if not channels:
+        await update.message.reply_text(
+            "⚠️ No premium channels available right now.\nPlease check back later!",
+            parse_mode="HTML"
+        )
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"pay_ch_{ch['channel_id']}")]
+        for ch in channels
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="pay_back_home")])
+    await update.message.reply_text(
+        "╔══════════════════════╗\n"
+        "   💳 <b>BUY SUBSCRIPTION</b>\n"
+        "╚══════════════════════╝\n\n"
+        "📢 <b>Step 1 — Choose a Channel</b>\n\n"
+        "Select the premium channel you want access to:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
 async def _pay_show_channels(query, context):
     """Step 1 — user picks a channel."""
     channels = db.get_managed_channels()
@@ -437,7 +462,6 @@ async def _pay_show_qr(query, context, channel_id: str, months: int, price: int)
 
     context.user_data["pay_months"] = months
     context.user_data["pay_price"]  = price
-    context.user_data["pay_awaiting_screenshot"] = True
 
     caption = (
         "╔══════════════════════╗\n"
@@ -447,39 +471,25 @@ async def _pay_show_qr(query, context, channel_id: str, months: int, price: int)
         f"📅 Plan    : <b>{plan_label}</b>\n"
         f"💰 Amount  : <b>₹{price}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📋 <b>STEP-BY-STEP PAYMENT GUIDE</b>\n"
+        "📋 <b>How to Pay</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>STEP 1 — Open Your UPI App</b>\n"
-        "┗ Open any UPI app on your phone:\n"
-        "   Google Pay / PhonePe / Paytm\n"
-        "   BHIM / any banking UPI app\n\n"
-        "<b>STEP 2 — Pay Using QR or UPI ID</b>\n"
-        "┣ 📷 <b>Option A:</b> Scan the QR code above\n"
-        f"┗ 🔤 <b>Option B:</b> Pay to UPI ID: <code>{UPI_ID}</code>\n\n"
-        "<b>STEP 3 — Enter the Exact Amount</b>\n"
-        f"┗ 💵 Type exactly: <b>₹{price}</b>\n"
-        "   ⚠️ Wrong amount = request rejected\n\n"
-        "<b>STEP 4 — Add a Note (Optional)</b>\n"
-        "┗ 📝 Write your Telegram username\n"
-        "   in the payment note / remarks field\n\n"
-        "<b>STEP 5 — Complete the Payment</b>\n"
-        "┗ ✅ Confirm and finish the transaction\n\n"
-        "<b>STEP 6 — Send Screenshot Here</b>\n"
-        "┗ 📸 Take a screenshot of the\n"
-        "   <b>payment success screen</b> and\n"
-        "   send it in <b>this chat right now</b>\n\n"
+        "1️⃣ Open any UPI app — Google Pay, PhonePe, Paytm, or BHIM\n"
+        "2️⃣ Scan the QR code shown above, or pay manually using this UPI ID:\n"
+        f"    <code>{UPI_ID}</code>\n"
+        f"3️⃣ Enter the exact amount: <b>₹{price}</b>\n"
+        "4️⃣ Complete the payment\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⏳ <b>What happens after screenshot:</b>\n"
-        "• Admin verifies your payment\n"
-        "• You receive a private invite link\n"
-        "• Link is valid for <b>1 hour only — join fast!</b>\n\n"
-        "⚠️ <i>Do NOT close this chat.\n"
-        "Do NOT send the screenshot multiple times.</i>"
+        "ℹ️ <b>Important</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Once your payment is successful, please tap the "
+        "<b>\"Payment Done ✅\"</b> button below.\n\n"
+        "Our team will verify your payment shortly and activate your subscription."
     )
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Cancel", callback_data="pay_cancel")
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Payment Done", callback_data="pay_done")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="pay_cancel")],
+    ])
 
     if QR_URL:
         # QR URL is set — delete old message and send photo via URL
@@ -509,6 +519,119 @@ async def _pay_show_qr(query, context, channel_id: str, months: int, price: int)
 
 
 # ─────────────────────────────────────────────
+#  PAYMENT — User taps "Payment Done ✅"
+# ─────────────────────────────────────────────
+
+async def _handle_payment_done(query, context):
+    """Runs when the user taps the 'Payment Done ✅' button after viewing the QR."""
+    user = query.from_user
+
+    channel_id   = context.user_data.get("pay_channel_id")
+    channel_name = context.user_data.get("pay_channel_name", channel_id)
+    months       = context.user_data.get("pay_months")
+    price        = context.user_data.get("pay_price")
+
+    async def reply(text: str):
+        try:
+            await query.edit_message_caption(text, parse_mode="HTML")
+        except Exception:
+            try:
+                await query.edit_message_text(text, parse_mode="HTML")
+            except Exception:
+                await query.message.reply_text(text, parse_mode="HTML")
+
+    if not all([channel_id, months, price]):
+        await reply("⚠️ Your session has expired. Please start again with /pay.")
+        context.user_data.clear()
+        return
+
+    existing = db.get_user_pending_payment(user.id, channel_id)
+    if existing:
+        await reply(
+            "⏳ You already have a <b>pending payment request</b> for this channel.\n\n"
+            "Please wait for admin approval."
+        )
+        context.user_data.clear()
+        return
+
+    username = user.username or user.first_name or str(user.id)
+    request_id = db.add_payment_request(
+        user_id=user.id,
+        channel_id=channel_id,
+        channel_name=channel_name,
+        username=username,
+        first_name=user.first_name or "",
+        months=months,
+        amount=price,
+    )
+    # Keep flow data alive — needed for "Generate QR Again" / screenshot upload
+    context.user_data["pay_request_id"] = request_id
+
+    plan_label  = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
+    display_name = user.first_name or username
+    order_id    = f"IMX{user.id}"
+    time_str    = to_ist(now_utc()).strftime('%d %b, %I:%M %p')
+
+    proof_msg = (
+        "✅ <b>SUBMIT PAYMENT PROOF</b> 📋!!\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⬛ <b>IMPORTANT:</b> <i>Please send the payment screenshot to our admin immediately.</i>\n\n"
+        f"👤 User: <b>{display_name}</b> (<code>{user.id}</code>)\n"
+        f"🧾 Order ID: <code>{order_id}</code>\n"
+        f"🕐 Time: {time_str}\n\n"
+        "⚠️ <i>Note: Without screenshot, verification may take longer!</i>\n\n"
+        "Thank you for your patience! 🙏"
+    )
+    proof_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 Send Payment Screenshot Here ✅", callback_data="pay_send_ss")],
+        [InlineKeyboardButton("🔄 Generate QR Again", callback_data="pay_regen")],
+        [InlineKeyboardButton("❌ Close", callback_data="pay_close")],
+    ])
+
+    try:
+        await query.edit_message_caption(proof_msg, parse_mode="HTML", reply_markup=proof_keyboard)
+    except Exception:
+        try:
+            await query.edit_message_text(proof_msg, parse_mode="HTML", reply_markup=proof_keyboard)
+        except Exception:
+            await query.message.reply_text(proof_msg, parse_mode="HTML", reply_markup=proof_keyboard)
+
+    # Notify owner with Approve / Reject (screenshot may follow separately)
+    user_link = f'<a href="tg://user?id={user.id}">{display_name}</a>'
+    owner_caption = (
+        "╔══════════════════════╗\n"
+        "   💳 <b>NEW PAYMENT REQUEST</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"🆔 Request ID: <code>{request_id}</code>\n"
+        f"🧾 Order ID: <code>{order_id}</code>\n\n"
+        f"👤 Name: {user_link}\n"
+        f"🔖 Username: @{username}\n"
+        f"🆔 User ID: <code>{user.id}</code>\n"
+        f"📢 Channel: <b>{channel_name}</b>\n"
+        f"📅 Plan: <b>{plan_label}</b>\n"
+        f"💰 Amount: <b>₹{price}</b>\n\n"
+        "ℹ️ The user has confirmed payment using the <b>Payment Done</b> button.\n"
+        "Screenshot may follow shortly for faster verification.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ Approve → create invite link & activate subscription\n"
+        "❌ Reject → notify user, no access"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"pmt_approve_{request_id}"),
+        InlineKeyboardButton("❌ Reject",  callback_data=f"pmt_reject_{request_id}"),
+    ]])
+    try:
+        await context.bot.send_message(
+            chat_id=Config.OWNER_ID,
+            text=owner_caption,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify owner about payment: {e}")
+
+
+# ─────────────────────────────────────────────
 #  PAYMENT — User sends screenshot
 # ─────────────────────────────────────────────
 
@@ -519,25 +642,15 @@ async def handle_user_payment_screenshot(update: Update, context: ContextTypes.D
     if not context.user_data.get("pay_awaiting_screenshot"):
         return   # not in payment flow
 
-    channel_id = context.user_data.get("pay_channel_id")
+    channel_id   = context.user_data.get("pay_channel_id")
     channel_name = context.user_data.get("pay_channel_name", channel_id)
-    months     = context.user_data.get("pay_months")
-    price      = context.user_data.get("pay_price")
+    months       = context.user_data.get("pay_months")
+    price        = context.user_data.get("pay_price")
+    request_id   = context.user_data.get("pay_request_id")
 
     if not all([channel_id, months, price]):
         await update.message.reply_text(
-            "⚠️ Session expired. Please start again with /start.",
-            parse_mode="HTML"
-        )
-        context.user_data.clear()
-        return
-
-    # Check if already has pending request for this channel
-    existing = db.get_user_pending_payment(user.id, channel_id)
-    if existing:
-        await update.message.reply_text(
-            "⏳ You already have a <b>pending payment request</b> for this channel.\n\n"
-            "Please wait for admin approval.",
+            "⚠️ Session expired. Please start again with /pay.",
             parse_mode="HTML"
         )
         context.user_data.clear()
@@ -546,44 +659,60 @@ async def handle_user_payment_screenshot(update: Update, context: ContextTypes.D
     photo = update.message.photo[-1]
     screenshot_file_id = photo.file_id
     username = user.username or user.first_name or str(user.id)
+    plan_label = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
 
-    # Save payment request
-    request_id = db.add_payment_request(
-        user_id=user.id,
-        channel_id=channel_id,
-        channel_name=channel_name,
-        username=username,
-        first_name=user.first_name or "",
-        months=months,
-        amount=price,
-        screenshot_file_id=screenshot_file_id
-    )
+    existing_request = db.get_payment_request(request_id) if request_id else None
+
+    if existing_request and existing_request.get("status") == "pending":
+        # Request was already created when the user tapped "Payment Done" —
+        # just attach the screenshot to it for faster verification.
+        db.update_payment_screenshot(request_id, screenshot_file_id)
+    else:
+        # No active request found for this session — guard against duplicates, then create one.
+        other_pending = db.get_user_pending_payment(user.id, channel_id)
+        if other_pending:
+            await update.message.reply_text(
+                "⏳ You already have a <b>pending payment request</b> for this channel.\n\n"
+                "Please wait for admin approval.",
+                parse_mode="HTML"
+            )
+            context.user_data.clear()
+            return
+        request_id = db.add_payment_request(
+            user_id=user.id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            username=username,
+            first_name=user.first_name or "",
+            months=months,
+            amount=price,
+            screenshot_file_id=screenshot_file_id
+        )
 
     context.user_data.clear()
 
     # Confirm to user
     await update.message.reply_text(
         "╔══════════════════════╗\n"
-        "   ✅ <b>PAYMENT SUBMITTED!</b>\n"
+        "   ✅ <b>SCREENSHOT RECEIVED!</b>\n"
         "╚══════════════════════╝\n\n"
         f"🆔 Request ID: <code>{request_id}</code>\n\n"
-        "📸 Your payment screenshot has been received.\n\n"
+        "📸 Your payment screenshot has been forwarded to our admin.\n\n"
         "⏳ <b>What happens next?</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ Admin will verify your payment\n"
-        f"2️⃣ You'll receive a <b>channel invite link</b>\n"
+        "2️⃣ You'll receive a <b>channel invite link</b>\n"
         "3️⃣ The link is valid for <b>1 hour only</b> — join quickly!\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "💬 Contact admin if you don't hear back within 30 minutes.",
         parse_mode="HTML"
     )
 
-    # Notify owner with Approve / Reject
-    plan_label = next((l for l, m, p in PLANS if m == months and p == price), f"{months}M")
+    # Notify owner with Approve / Reject (now with the screenshot attached)
     user_link = f'<a href="tg://user?id={user.id}">{user.first_name or username}</a>'
     owner_caption = (
         "╔══════════════════════╗\n"
-        "   💳 <b>NEW PAYMENT REQUEST</b>\n"
+        "   📸 <b>PAYMENT SCREENSHOT RECEIVED</b>\n"
         "╚══════════════════════╝\n\n"
         f"🆔 Request ID: <code>{request_id}</code>\n\n"
         f"👤 Name: {user_link}\n"
@@ -667,25 +796,39 @@ async def _approve_payment(query, context, request_id: str):
         invite_url = None
 
     # Notify user
-    caption_prefix = "🔄 <b>Subscription Renewed!</b>" if is_renewal else "🎉 <b>Subscription Approved!</b>"
+    if is_renewal:
+        header = "🔄 <b>Subscription Renewal Notice</b> 🔄"
+        intro  = "We are pleased to formally confirm that your payment has been verified and your premium subscription has been <b>successfully renewed</b>. 🎉"
+    else:
+        header = "✅ <b>Subscription Approval Notice</b> ✅"
+        intro  = "We are pleased to formally confirm that your payment has been verified and your premium subscription has been <b>successfully activated</b>. 🎉"
+
     user_msg = (
-        f"{caption_prefix}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📢 Channel: <b>{channel_name}</b>\n"
-        f"📅 Plan: <b>{plan_label}</b>\n"
-        f"📆 Expires: <b>{to_ist(expiry).strftime('%d %b %Y %H:%M')} IST</b>\n"
-        f"⏳ Duration: <b>{fmt_remaining(expiry)}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{header}\n\n"
+        f"Dear Subscriber <b>@{username}</b>,\n\n"
+        f"{intro}\n\n"
+        f"📢 <b>Channel:</b> {channel_name}\n"
+        f"📅 <b>Plan:</b> {plan_label}\n"
+        f"📆 <b>Valid Until:</b> {fmt_ist_full(expiry)}\n"
+        f"⏳ <b>Duration:</b> {fmt_remaining(expiry)}\n\n"
     )
     if invite_url:
         user_msg += (
-            "🔗 <b>Your Channel Invite Link:</b>\n"
+            "🔗 <b>Your Channel Invite Link</b>\n"
             f"<a href=\"{invite_url}\">{invite_url}</a>\n\n"
-            "⚠️ <b>This link expires in 1 hour — join now!</b>\n"
-            "🔒 It's a one-time link, don't share it."
+            "⚠️ <b>Important:</b> This link is valid for <b>1 hour only</b> and can be used once. "
+            "Please join promptly.\n\n"
         )
     else:
-        user_msg += "⚠️ Could not generate invite link. Contact admin for manual access."
+        user_msg += (
+            "⚠️ We were unable to generate your invite link automatically. "
+            "Kindly contact our admin for manual access.\n\n"
+        )
+    user_msg += (
+        "We sincerely appreciate your trust in our service. 🙏\n\n"
+        "Warm regards,\n"
+        "<b>VM-MRx, Marathi_Serialsx Management Team</b>"
+    )
 
     try:
         await context.bot.send_message(uid, user_msg, parse_mode="HTML")
@@ -730,17 +873,19 @@ async def _reject_payment(query, context, request_id: str):
     try:
         await context.bot.send_message(
             uid,
-            "╔══════════════════════╗\n"
-            "   ❌ <b>PAYMENT REJECTED</b>\n"
-            "╚══════════════════════╝\n\n"
-            f"📢 Channel: <b>{channel_name}</b>\n"
-            f"💰 Amount: <b>₹{price}</b>\n\n"
-            "Your payment could not be verified.\n\n"
-            "❓ <b>Possible reasons:</b>\n"
+            "🔔 <b>Subscription Payment Notice</b> 🔔\n\n"
+            f"Dear Subscriber <b>@{username}</b>,\n\n"
+            "We regret to inform you that we were unable to verify your recent payment, "
+            "and your subscription request could not be approved at this time. ❌\n\n"
+            f"📢 <b>Channel:</b> {channel_name}\n"
+            f"💰 <b>Amount:</b> ₹{price}\n\n"
+            "📋 <b>Possible Reasons</b>\n"
             "• Screenshot unclear or invalid\n"
-            "• Wrong amount paid\n"
+            "• Incorrect amount paid\n"
             "• Payment not received\n\n"
-            "💬 Contact admin if you believe this is a mistake.",
+            "If you believe this is a mistake, kindly contact our admin for assistance. 🙏\n\n"
+            "Warm regards,\n"
+            "<b>VM-MRx, Marathi_Serialsx Management Team</b>",
             parse_mode="HTML"
         )
     except Exception:
@@ -899,6 +1044,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         months     = int(parts[1])
         price      = int(parts[2])
         await _pay_show_qr(query, context, channel_id, months, price)
+
+    elif data == "pay_done":
+        await _handle_payment_done(query, context)
+
+    elif data == "pay_send_ss":
+        context.user_data["pay_awaiting_screenshot"] = True
+        await query.message.reply_text(
+            "📸 <b>Please send your payment screenshot now.</b>\n\n"
+            "We'll forward it to our admin for faster verification.",
+            parse_mode="HTML"
+        )
+
+    elif data == "pay_regen":
+        channel_id = context.user_data.get("pay_channel_id")
+        months     = context.user_data.get("pay_months")
+        price      = context.user_data.get("pay_price")
+        if not all([channel_id, months, price]):
+            await query.message.reply_text(
+                "⚠️ Your session has expired. Please start again with /pay.",
+                parse_mode="HTML"
+            )
+            context.user_data.clear()
+        else:
+            await _pay_show_qr(query, context, channel_id, months, price)
+
+    elif data == "pay_close":
+        context.user_data.clear()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.chat.send_message(
+            "❌ Payment request closed.\n\nTap /pay to start again whenever you're ready.",
+            parse_mode="HTML"
+        )
 
     elif data == "pay_cancel":
         context.user_data.clear()
@@ -2061,6 +2241,7 @@ def main():
     app = Application.builder().token(Config.BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",         start))
+    app.add_handler(CommandHandler("pay",           pay_command))
     app.add_handler(CommandHandler("mysubs",        my_subscriptions))
     app.add_handler(CommandHandler("help",          help_command))
     app.add_handler(CommandHandler("admin",         admin_panel))
